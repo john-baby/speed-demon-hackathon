@@ -15,7 +15,7 @@ Rust, standard library only, one binary (`src/main.rs`), x86-64 (SSE2 intrinsics
 
    Each latency is appended to its (hour, endpoint) group in a chain of 8-entry blocks in the thread's own arena, so nothing is counted first and nothing is copied later. The input's lines are roughly in time order, so a chunk touches only a few hours' groups.
 3. **Rank endpoints once.** The 1,842 distinct endpoints from all threads are merged and sorted as bytes; each thread's ids are mapped to that rank, which is the output order.
-4. **Select, don't sort.** Threads take hours one at a time. For each group they gather its blocks from every chunk and find nearest-rank p50/p95/p99 with three nested `select_nth_unstable` calls, each searching only above the previous rank. The main thread writes finished hours out in order while the others work.
+4. **Select, don't sort.** Threads take hours one at a time. For each group they gather its blocks from every chunk and find nearest-rank p50/p95/p99 with three nested `select_nth_unstable` calls, each searching only above the previous rank. Each thread writes its hour as soon as the hour before it is written, so only one hour of output per thread is ever held.
 
 Peak memory is the latencies (4 bytes per line) plus a few bytes per group of slack and chain links: about 15 MB for the full input, plus small per-thread tables.
 

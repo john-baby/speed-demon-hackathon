@@ -1,12 +1,12 @@
 // Speed Demon 2026, Track A (Ingest). See README.md for the approach.
 use std::io::Write;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Condvar, Mutex};
 use std::thread;
 use std::arch::x86_64::*;
 
 const HOURS: usize = 72; // 2026-10-30T18:00Z .. 2026-11-02T17:59Z, fixed by the spec
 const B: usize = 8; // latencies per block: few to waste in a group's last block
-const CAP: usize = 4096; // endpoint ids per chunk; the spec's catalogue has 1,842
 
 // Map the input read-only; the host has it in the page cache, so it is not charged to us.
 #[cfg(unix)]
@@ -79,7 +79,8 @@ struct Names {
 // One thread's view of its chunk, with its own endpoint ids.
 struct Chunk {
     t: Names,
-    groups: Vec<Group>,  // [hour][endpoint id]; a chunk spans few hours, so few pages are touched
+    groups: Vec<Vec<Group>>, // [hour][endpoint id], grown on demand: a fixed-size table was
+                             // touched in full by probing every hour, about 3.5 MB per thread
     lats: Vec<[u32; B]>, // each group's latencies, in a chain of blocks
     prev: Vec<u32>,      // the block before each block in its group's chain
 }
@@ -93,7 +94,7 @@ struct Slot {
 
 impl Names {
     fn new() -> Names {
-        Names { names: Vec::new(), pre: Vec::new(), slots: vec![Slot::default(); 2 * CAP] }
+        Names { names: Vec::new(), pre: Vec::new(), slots: vec![Slot::default(); 1 << 13] }
     }
 
     // The id of an endpoint already in memory, padded as `parse` reads it.
@@ -153,8 +154,8 @@ impl Chunk {
 
 // The only pass over the input: intern each line's endpoint and append its latency to its group.
 fn parse(d: &[u8]) -> Chunk {
-    let blocks = d.len() / 256; // about twice what typical lines need; untouched capacity costs nothing
-    let mut c = Chunk { t: Names::new(), groups: vec![Group::default(); HOURS * CAP],
+    let blocks = d.len() / 512; // about what typical lines need
+    let mut c = Chunk { t: Names::new(), groups: vec![Vec::new(); HOURS],
         lats: Vec::with_capacity(blocks), prev: Vec::with_capacity(blocks) };
     // Every line has exactly four spaces and a newline, so the separators, in order, come in
     // fives and no field is ever searched for. They are collected 64 bytes at a time.
@@ -187,7 +188,11 @@ fn parse(d: &[u8]) -> Chunk {
             // The status and latency follow the endpoint, so 8-byte reads at s are in bounds.
             let (head, tail) = if len >= 8 { (word(d, s), word(d, e - 8)) } else { (word(d, s) & ((1 << (8 * len)) - 1), 0) };
             let id = c.t.id(&d[s..e], d.get(s..s + 64).map(|w| w.try_into().unwrap()), head, tail);
-            let g = &mut c.groups[hour(d, p) * CAP + id];
+            let row = &mut c.groups[hour(d, p)];
+            if id >= row.len() {
+                row.resize(c.t.names.len(), Group::default());
+            }
+            let g = &mut row[id];
             let k = g.n as usize % B;
             if k == 0 {
                 c.prev.push(g.block);
@@ -271,33 +276,30 @@ fn main() {
         l
     }).collect();
     let names: Vec<&[u8]> = order.iter().map(|&i| &all.names[i][..]).collect();
-    // The longest an hour's output can be: label, name, six 10-digit numbers, spaces, newline.
-    let most: usize = names.iter().map(|n| n.len() + 88).sum();
 
     // 3. Each thread takes the next hour, merges every group's blocks from all chunks and
-    // finds the nearest-rank percentiles by selection. Meanwhile this thread writes the
-    // finished hours out in order, so little output is held at once.
+    // finds the nearest-rank percentiles by selection. It writes the hour itself once the
+    // hour before is written, so each thread holds one hour of output, not a backlog.
     let next = AtomicUsize::new(0);
-    let mut f = std::fs::File::create(format!("{out_dir}/summary.txt")).unwrap();
+    let f = std::fs::File::create(format!("{out_dir}/summary.txt")).unwrap();
+    let turn = (Mutex::new(0), Condvar::new()); // the next hour to write
     thread::scope(|sc| {
-        let (tx, rx) = std::sync::mpsc::channel();
         for _ in 0..nt {
-            let (chunks, local, names, next, most, tx) = (&chunks, &local, &names, &next, most, tx.clone());
+            let (chunks, local, names, next, f, turn) = (&chunks, &local, &names, &next, &f, &turn);
             sc.spawn(move || {
-                let mut v = Vec::new();
+                let (mut v, mut o) = (Vec::new(), Vec::new());
                 loop {
                     let h = next.fetch_add(1, Ordering::Relaxed);
                     if h >= HOURS {
                         return;
                     }
                     let label = hour_label(h);
-                    let mut o = Vec::with_capacity(most); // never grown, so never copied
+                    o.clear();
                     for (r, name) in names.iter().enumerate() {
                         v.clear();
                         let mut e = 0;
                         for (c, l) in chunks.iter().zip(local) {
-                            if l[r] < CAP && c.groups[h * CAP + l[r]].n > 0 {
-                                let g = c.groups[h * CAP + l[r]];
+                            if let Some(&g) = c.groups[h].get(l[r]).filter(|g| g.n > 0) {
                                 c.gather(g, &mut v);
                                 e += g.errors as usize;
                             }
@@ -321,18 +323,12 @@ fn main() {
                         }
                         o.push(b'\n');
                     }
-                    tx.send((h, o)).unwrap();
+                    let mut w = turn.1.wait_while(turn.0.lock().unwrap(), |w| *w != h).unwrap();
+                    (&*f).write_all(&o).unwrap();
+                    *w += 1;
+                    turn.1.notify_all();
                 }
             });
-        }
-        drop(tx);
-        let (mut done, mut w) = (vec![None; HOURS], 0);
-        for (h, o) in rx {
-            done[h] = Some(o);
-            while let Some(o) = done.get_mut(w).and_then(Option::take) {
-                f.write_all(&o).unwrap();
-                w += 1;
-            }
         }
     });
 }
