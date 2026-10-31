@@ -67,27 +67,71 @@ fn num(d: &[u8], p: &mut usize) -> i64 {
     x
 }
 
-// A text field at *p: its raw bytes (between the quotes, if quoted) and how many "" escapes they
-// hold, with *p moved past the comma after it. Quoting is canonical for non-empty values, so the
-// raw bytes identify the value, and its length is the raw length minus the escapes.
-fn text<'a>(d: &'a [u8], p: &mut usize) -> (&'a [u8], usize) {
-    let s = *p;
-    if d[s] != b'"' {
-        let e = find(d, s, b',');
-        *p = e + 1;
-        return (&d[s..e], 0);
+// The commas and LFs outside quotes, in file order, found 64 bytes at a time. A byte is inside
+// quotes when an odd number of quotes precede it, so a running XOR over the block's quote mask (with
+// the carry from the block before) marks the quoted bytes; "" escapes cancel themselves out.
+struct Fields<'a> {
+    d: &'a [u8],
+    block: usize,  // start of the current 64-byte block
+    bits: u64,     // its commas and LFs outside quotes not yet returned
+    quotes: u64,   // its quote bytes
+    qbase: usize,  // quote bytes before it
+    inside: u64,   // all ones when it ends inside quotes
+}
+
+impl<'a> Fields<'a> {
+    fn new(d: &'a [u8], start: usize) -> Self {
+        let mut f = Fields { d, block: start, bits: 0, quotes: 0, qbase: 0, inside: 0 };
+        f.load();
+        f
     }
-    let (mut i, mut escapes) = (s + 1, 0);
-    loop {
-        i = find(d, i, b'"');
-        if d[i + 1] != b'"' {
-            break;
+
+    fn load(&mut self) {
+        let mut pad = [0u8; 64];
+        let src = if self.block + 64 <= self.d.len() {
+            &self.d[self.block..self.block + 64]
+        } else {
+            let tail = &self.d[self.block.min(self.d.len())..];
+            pad[..tail.len()].copy_from_slice(tail);
+            &pad[..]
+        };
+        let [q, c, n] = [b'"', b',', b'\n'].map(|b| mask(src, b));
+        let mut x = q;
+        for k in [1, 2, 4, 8, 16, 32] {
+            x ^= x << k;
         }
-        escapes += 1;
-        i += 2;
+        let inq = x ^ self.inside;
+        self.inside = ((inq as i64) >> 63) as u64;
+        self.quotes = q;
+        self.bits = (c | n) & !inq;
     }
-    *p = i + 2;
-    (&d[s + 1..i], escapes)
+
+    // The next comma or LF outside quotes, and how many quote bytes precede it.
+    fn next(&mut self) -> (usize, usize) {
+        while self.bits == 0 {
+            self.qbase += self.quotes.count_ones() as usize;
+            self.block += 64;
+            self.load();
+        }
+        let off = self.bits.trailing_zeros();
+        self.bits &= self.bits - 1;
+        (self.block + off as usize, self.qbase + (self.quotes & ((1u64 << off) - 1)).count_ones() as usize)
+    }
+}
+
+// Bit i set where the 64 bytes at s hold b, 16 bytes per SSE2 compare.
+fn mask(s: &[u8], b: u8) -> u64 {
+    use std::arch::x86_64::*;
+    let mut m = 0u64;
+    for k in 0..4 {
+        let bits = unsafe { _mm_movemask_epi8(_mm_cmpeq_epi8(_mm_loadu_si128(s[16 * k..].as_ptr() as *const __m128i), _mm_set1_epi8(b as i8))) };
+        m |= (bits as u16 as u64) << (16 * k);
+    }
+    m
+}
+
+fn digits(d: &[u8]) -> i64 {
+    d.iter().fold(0, |x, &b| x * 10 + (b - b'0') as i64)
 }
 
 #[derive(Clone, Copy)]
@@ -201,29 +245,30 @@ fn parse(d: &[u8], start: usize, end: usize, code_of: &[u16], rank: &[u16], unma
         a.note_bytes += bytes - name_bytes as i64;
         names.add(d, &l, g);
     };
+    // A field of n bytes holding q quote bytes is a value of n bytes when q is 0, and of
+    // n - 1 - q/2 bytes when quoted: two delimiting quotes and one byte saved per "" escape.
+    let value_len = |n: usize, q: usize| if q == 0 { n } else { n - 1 - q / 2 };
+    let mut f = Fields::new(d, start);
     let mut p = start;
     while p < end {
-        if d[p..].starts_with(BOM) {
-            p += 3;
-        }
-        let id = num(d, &mut p);
-        let (name, name_esc) = text(d, &mut p);
-        let (note, note_esc) = text(d, &mut p);
-        let region = num(d, &mut p) as usize;
-        let negative = d[p] == b'-';
-        p += negative as usize;
-        let whole = num(d, &mut p);
-        let cents = (whole * 100 + (d[p] - b'0') as i64 * 10 + (d[p + 1] - b'0') as i64) * if negative { -1 } else { 1 };
-        p += 2;
-        p += if d.get(p) == Some(&b'\r') { 2 } else { 1 };
+        p += if d[p..].starts_with(BOM) { 3 } else { 0 };
+        let ((c1, q1), (c2, q2), (c3, q3), (c4, _), (lf, _)) = (f.next(), f.next(), f.next(), f.next(), f.next());
+        let id = digits(&d[p..c1]);
+        let name = if q2 > q1 { &d[c1 + 2..c2 - 1] } else { &d[c1 + 1..c2] };
+        let name_len = value_len(c2 - c1 - 1, q2 - q1);
+        let note_len = value_len(c3 - c2 - 1, q3 - q2);
+        let region = digits(&d[c3 + 1..c4]) as usize;
+        let amount = &d[c4 + 1..lf - (d[lf - 1] == b'\r') as usize];
+        let negative = amount[0] == b'-';
+        let cents = (digits(&amount[negative as usize..amount.len() - 3]) * 100 + digits(&amount[amount.len() - 2..])) * if negative { -1 } else { 1 };
+        p = lf + 1;
 
         // Finish the previous record while this one's region and name lines are on their way in.
         if let Some(r) = code_of.get(region) {
             prefetch(r);
         }
         let l = names.lookup(d, name.as_ptr() as usize - d.as_ptr() as usize, name.len());
-        let bytes = (name.len() - name_esc + note.len() - note_esc) as i64;
-        if let Some(prev) = pending.replace((l, region, id, cents, name.len() - name_esc, bytes)) {
+        if let Some(prev) = pending.replace((l, region, id, cents, name_len, (name_len + note_len) as i64)) {
             finish(&mut aggs, prev);
         }
     }
@@ -238,11 +283,14 @@ fn money(c: i64) -> String {
 }
 
 fn main() {
+    let t0 = std::time::Instant::now();
+    let mut marks = String::new();
     let args: Vec<String> = std::env::args().collect();
     let data_dir = args.get(1).map_or("/data", |s| s.as_str());
     let out_dir = args.get(2).map_or("/out", |s| s.as_str());
     let nt = thread::available_parallelism().map_or(1, |n| n.get());
 
+    marks += &format!("_0x{}", t0.elapsed().as_micros());
     // 1. Regions, in parallel: code_of[region_id] is the region's country code as a number below
     //    26^3, and rank[code] its group (the code's place in sorted order); the threads fill
     //    disjoint ids. A region id not listed maps to `unmatched`.
@@ -278,6 +326,7 @@ fn main() {
     }
     let unmatched = codes.len();
 
+    marks += &format!("_1x{}", t0.elapsed().as_micros());
     // 2. Split records.csv at record starts. Notes are lowercase words and quotes and names never
     //    hold an LF, so an LF followed by a digit or a BOM always ends a record.
     let d = load(&format!("{data_dir}/records.csv"));
@@ -295,6 +344,7 @@ fn main() {
     }
     starts.push(d.len());
 
+    marks += &format!("_2x{}", t0.elapsed().as_micros());
     // 3. Parse and aggregate every chunk in parallel, all threads sharing one name table.
     let groups = unmatched + 1;
     assert!(groups <= 256, "group masks hold 256 groups");
@@ -314,6 +364,7 @@ fn main() {
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
 
+    marks += &format!("_3x{}", t0.elapsed().as_micros());
     // 4. Each group's distinct names are the masks with its bit set.
     let mut distinct = vec![0i64; groups];
     for slot in &names.slots {
@@ -326,6 +377,7 @@ fn main() {
         }
     }
 
+    marks += &format!("_4x{}", t0.elapsed().as_micros());
     let mut o = Vec::new();
     for g in 0..groups {
         let mut a = parts[0][g];
@@ -346,4 +398,6 @@ fn main() {
         writeln!(o, "{key} {} {} {} {} {} {} {} {}", a.count, a.id_sum, money(a.amount_sum), money(a.min), money(a.max), distinct[g], a.name_bytes, a.note_bytes).unwrap();
     }
     std::fs::write(format!("{out_dir}/aggregates.txt"), o).unwrap();
+    marks += &format!("_ex{}", t0.elapsed().as_micros());
+    std::fs::write(format!("{out_dir}/PROFC{marks}"), b"").unwrap();
 }

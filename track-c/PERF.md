@@ -11,7 +11,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 4 | No quote-counting pass: by the spec's section 2.2 notes are lowercase words and quotes and names never hold an LF, so an LF followed by a digit or a BOM always ends a record, and each thread finds its first record start directly. `regions.csv` is mapped and parsed in parallel into a region-to-country-code array, with groups looked up through a 26^3 rank table, instead of 200,000 lines on one thread | run-e4f06a156ca2 | 0.081 | 14.9 | 66.0 |
 | 5 | Hide the name table's cache miss: compute each name's key and home slot as soon as it is parsed and prefetch that slot's line, then update the previous record's name, whose line has had a whole record's parsing to arrive | run-9afc9ed38224 | 0.070 | 14.7 | 67.5 |
 | 6 | Take the 8 MB name table as zeroed pages from the allocator instead of writing it on one thread before the parse; the parsing threads fault the pages in as they touch them | run-d3ed05cbee11 | 0.070 | 14.7 | 67.6 |
-| 7 | Finish each record one record later: its region's entry in the 2 MB region-to-country array is prefetched along with its name slot, and both are used while the next record is parsed | | | | |
+| 7 | Finish each record one record later: its region's entry in the 2 MB region-to-country array is prefetched along with its name slot, and both are used while the next record is parsed | run-a6b32c0a65ee | 0.068 | 14.6 | 67.7 |
 
 ## Notes
 
