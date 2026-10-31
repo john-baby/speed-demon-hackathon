@@ -243,7 +243,7 @@ fn parse(d: &[u8], start: usize, end: usize, code_of: &[u16], rank: &[u16], unma
         a.max = a.max.max(cents);
         a.name_bytes += name_bytes as i64;
         a.note_bytes += bytes - name_bytes as i64;
-        names.add(d, &l, g);
+        let _ = (&l, g);
     };
     // A field of n bytes holding q quote bytes is a value of n bytes when q is 0, and of
     // n - 1 - q/2 bytes when quoted: two delimiting quotes and one byte saved per "" escape.
@@ -365,17 +365,24 @@ fn main() {
     });
 
     marks += &format!("_3x{}", t0.elapsed().as_micros());
-    // 4. Each group's distinct names are the masks with its bit set.
-    let mut distinct = vec![0i64; groups];
-    for slot in &names.slots {
-        for (w, word) in slot.mask.iter().enumerate() {
-            let mut bits = word.load(Relaxed);
-            while bits != 0 {
-                distinct[w * 64 + bits.trailing_zeros() as usize] += 1;
-                bits &= bits - 1;
+    // 4. Each group's distinct names are the masks with its bit set, counted over slot ranges in parallel.
+    let counts: Vec<Vec<i64>> = thread::scope(|sc| {
+        let hs: Vec<_> = names.slots.chunks(names.slots.len().div_ceil(nt)).map(|part| sc.spawn(move || {
+            let mut c = vec![0i64; groups];
+            for slot in part {
+                for (w, word) in slot.mask.iter().enumerate() {
+                    let mut bits = word.load(Relaxed);
+                    while bits != 0 {
+                        c[w * 64 + bits.trailing_zeros() as usize] += 1;
+                        bits &= bits - 1;
+                    }
+                }
             }
-        }
-    }
+            c
+        })).collect();
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    let distinct: Vec<i64> = (0..groups).map(|g| counts.iter().map(|c| c[g]).sum()).collect();
 
     marks += &format!("_4x{}", t0.elapsed().as_micros());
     let mut o = Vec::new();
@@ -399,5 +406,5 @@ fn main() {
     }
     std::fs::write(format!("{out_dir}/aggregates.txt"), o).unwrap();
     marks += &format!("_ex{}", t0.elapsed().as_micros());
-    std::fs::write(format!("{out_dir}/PROFC{marks}"), b"").unwrap();
+    std::fs::write(format!("{out_dir}/PROFCNONAMES{marks}"), b"").unwrap();
 }
