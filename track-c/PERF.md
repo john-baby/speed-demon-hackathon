@@ -29,6 +29,7 @@ Board profiles (steps 7, 10 and 11) guided each change.
 | 13 | Each thread maps its share of the file with `madvise(MADV_POPULATE_READ)` before parsing. Reverted | run-3e55edd37b4d | 0.058 | 16.3 | 68.2 |
 | 14 | Half as many threads (6). Reverted | run-551f7fb4ea50 | 0.084 | 14.3 | 64.8 |
 | 15 | Twice as many threads (24). Reverted | run-c9fcf1def886 | 0.056 | 19.5 | 67.8 |
+| 16 | Read `records.csv` with `pread` into one reused 64 KB buffer per thread instead of mapping it, so there is no 200 MB mapping to tear down at exit: each piece is parsed up to its last whole record and the rest is read again with the next piece, and a name over 24 bytes keeps its tail in an append-only arena. Reverted: 0.0502 s against 0.0495 s for step 11 just before it (run-77a0854beb2e), and S rose from 528 to 578 | run-de787d452975 | 0.050 | 17.3 | 69.3 |
 
 ## Notes
 
@@ -53,3 +54,4 @@ Board profiles (steps 7, 10 and 11) guided each change.
 - Tried after step 11 and not kept, none measurably faster: an owner-side name table fed with the 24-byte keys (much slower, 209-241 ms against 141-163 ms in the same batch); a one-byte BOM check, unchecked number loads and the region's group stored directly in `code_of` (within noise); dropping the one-record deferral (slower, 64.8/83.9 ms against 62.3/72.8 ms min/median, so it stays). A tag-byte array was not built: the whole probe loop is worth at most about 6 ms of 72 ms on the laptop.
 - Board profile of step 11 (run-f68866234c17, instrumented): regions 1.9 ms, split 2.0 ms, parse phase done at 46.7 ms with per-thread parse time 32.9-37.3 ms, barrier waits 2.3-6.5 ms and owner work 2.1-2.6 ms. Explicitly unmapping the 200 MB input took 4.8 ms, which is most of the time previously seen outside `main` (normally paid at exit). Steps 12-15 tested the obvious levers and none helped, so the current code is step 11.
 - Late on Oct 31 the board's timings became much noisier: step 11's code measured 0.048 s, 0.051 s and 0.071 s (run-b5081feba568) on three runs.
+- Step 16 targeted the 4.8 ms unmap from the step-11 profile. Avoiding the mapping saved that, but each thread then copies its 17 MB itself, and the board showed no net gain.
