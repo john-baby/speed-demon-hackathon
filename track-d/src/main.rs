@@ -2,7 +2,7 @@
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::io::Write;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicU64, AtomicU32, AtomicUsize, Ordering::Relaxed};
 use std::thread;
 
 // Map the input read-only; the host has it in the page cache, so it is not charged to us.
@@ -174,6 +174,7 @@ fn renumber(g: Graph, nt: usize) -> (Graph, Vec<AtomicU32>, impl Fn(usize) -> u3
         }).collect();
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
+    R1.store(anon(), Relaxed);
     drop(g);
     let prefix = |len: &dyn Fn(&(Vec<u32>, Vec<[u32; 2]>)) -> usize| -> Vec<u32> {
         parts.iter().scan(0, |acc, p| { let b = *acc; *acc += len(p) as u32; Some(b) }).collect()
@@ -201,6 +202,7 @@ fn renumber(g: Graph, nt: usize) -> (Graph, Vec<AtomicU32>, impl Fn(usize) -> u3
             });
         }
     });
+    R2.store(anon(), Relaxed);
     (Graph { off, adj }, ins, move |u: usize| new_id(tmp[u].load(Relaxed)))
 }
 
@@ -413,7 +415,15 @@ fn query<'g, K: Key>(f: &mut Side<'g, K>, b: &mut Side<'g, K>, s: u32, t: u32) -
     }
 }
 
+// Resident anonymous memory in MB, from /proc/self/status (0 elsewhere).
+fn anon() -> u64 {
+    std::fs::read_to_string("/proc/self/status").ok().and_then(|t| t.lines().find(|l| l.starts_with("RssAnon:")).and_then(|l| l.split_whitespace().nth(1)?.parse::<u64>().ok())).unwrap_or(0) / 1024
+}
+
+static R1: AtomicU64 = AtomicU64::new(0);
+static R2: AtomicU64 = AtomicU64::new(0);
 fn main() {
+    let mut marks = String::new();
     let args: Vec<String> = std::env::args().collect();
     let data_dir = args.get(1).map_or("/data", |s| s.as_str());
     let out_dir = args.get(2).map_or("/out", |s| s.as_str());
@@ -454,6 +464,7 @@ fn main() {
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
 
+    marks += &format!("_0a{}", anon());
     // 2. Each owner counts its nodes' out-degrees and places their edges in the forward graph; only
     //    the start of each owner's range in adj needs the others' totals.
     let mut off = vec![0u32; n + 1];
@@ -479,6 +490,7 @@ fn main() {
     let base: Vec<u32> = totals.iter().scan(0, |acc, &x| { let b = *acc; *acc += x; Some(b) }).collect();
     let m = totals.iter().sum::<u32>();
     off[n] = m;
+    marks += &format!("_1a{}", anon());
     let mut adj = vec![[0u32; 2]; m as usize];
     let fa = Shared(adj.as_mut_ptr());
     thread::scope(|sc| {
@@ -499,12 +511,16 @@ fn main() {
             });
         }
     });
+    marks += &format!("_2a{}", anon());
     drop(buckets);
     let fwd = Graph { off, adj };
 
+    marks += &format!("_3a{}", anon());
     // 3. Renumber nodes for locality, then derive the reverse graph.
     let (fwd, ins, rank) = renumber(fwd, nt);
+    marks += &format!("_4a{}", anon());
     let bwd = transpose(&fwd, &ins, nt);
+    marks += &format!("_5a{}", anon());
     drop(ins);
 
     // 4. Answer the queries on every core, each thread taking the next unanswered one.
@@ -515,6 +531,7 @@ fn main() {
         pairs.push((rank(num(&q, &mut p) as usize), rank(num(&q, &mut p) as usize)));
     }
     drop(rank);
+    marks += &format!("_6a{}", anon());
     let narrow = n <= 1 << 21; // node ids fit u64 heap keys
     let next = AtomicUsize::new(0);
     let answers: Vec<Vec<(usize, u64)>> = thread::scope(|sc| {
@@ -539,6 +556,7 @@ fn main() {
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
 
+    marks += &format!("_7a{}", anon());
     let mut dist = vec![0; pairs.len()];
     for (i, a) in answers.into_iter().flatten() {
         dist[i] = a;
@@ -552,4 +570,6 @@ fn main() {
         }
     }
     std::fs::write(format!("{out_dir}/distances.txt"), o).unwrap();
+    let hwm = std::fs::read_to_string("/proc/self/status").ok().and_then(|t| t.lines().find(|l| l.starts_with("VmHWM:")).map(|l| l.split_whitespace().nth(1).unwrap_or("0").to_string())).unwrap_or_default();
+    std::fs::write(format!("{out_dir}/MEMD{marks}_r1a{}_r2a{}_end{}_hwmkb{hwm}", R1.load(Relaxed), R2.load(Relaxed), anon()), b"").unwrap();
 }
