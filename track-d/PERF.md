@@ -10,7 +10,8 @@ Every step from the reference to your final version, each with the live-board ru
 | 3 | Renumber nodes for locality, in parallel: each thread grows breadth-first regions from seeds in its own id range, claiming nodes with an atomic flag; the threads' visiting orders, concatenated, are the new ids, and both graphs are rebuilt in parallel in that order | run-ec6a476241db | 0.384 | 156.4 | 57.3 |
 | 4 | Build only the forward graph from the text (one atomic counter per edge instead of two, half the random writes), renumber it, then derive the reverse graph by transposing the renumbered forward graph, where an edge's ends are mostly close so the counters and writes stay local | run-34c1a43625fb | 0.304 | 145.4 | 60.0 |
 | 5 | Radix heap instead of a binary heap: Dijkstra only pushes keys at or above the last minimum, so an entry can sit in the bucket of the highest bit where it differs from that minimum (O(1) push, few moves per entry). Reverted: 3% faster, but the extra code (S 390 to 434) and buckets (M +10 MB) cost more than it gained | run-2c55876175b1 | 0.295 | 155.2 | 59.7 |
-| 6 | Back to the binary heap. A distance table that a long search grew past 2^17 slots is replaced by a small one after the query, so twelve threads do not each hold the largest table they ever needed; the renumbering table is freed once the query endpoints are mapped | | | | |
+| 6 | Back to the binary heap. A distance table that a long search grew past 2^17 slots is replaced by a small one after the query, so twelve threads do not each hold the largest table they ever needed; the renumbering table is freed once the query endpoints are mapped | run-24f858881752 | 0.311 | 152.6 | 59.5 |
+| 7 | Distance tables start at 2^12 slots instead of 2^16 and are shrunk back after any query that grew them past 2^15: 24 tables at 2^16 were 19 MB before any search grew them | | | | |
 
 ## Notes
 
@@ -26,3 +27,4 @@ Every step from the reference to your final version, each with the live-board ru
 - Tried and dropped before step 5: indexing the distance table by the node id itself (consecutive ids form clusters that linear probing walks through, slower) and by blocks of 8 ids (no change); the probes are not the bottleneck.
 - Step 5 showed no change on the laptop (queries 330-370 ms either way), so it goes to the board to be measured.
 - Tried before step 6: choosing the side by smaller frontier key settles 9.71M nodes on the synthetic graph, the queue-size rule 9.57M, so the queue-size rule stays.
+- Step 6 on the board: memory did not drop (153 MB), so the long-query tables were not the peak; the peak is the query phase itself, where both graphs (94 MB) sit next to 24 distance tables that start at 2^16 slots (12 bytes each).

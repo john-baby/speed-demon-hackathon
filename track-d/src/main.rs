@@ -179,11 +179,11 @@ impl Map {
         }
     }
 
-    // Empty the table; one a long search grew past 2^17 slots goes back to the small size, so
+    // Empty the table; one a long search grew past 2^15 slots goes back to the small size, so
     // twelve threads do not each keep the largest table they ever needed.
     fn clear(&mut self) {
-        if self.keys.len() > 1 << 17 {
-            *self = Map::new(16);
+        if self.keys.len() > 1 << 15 {
+            *self = Map::new(12);
         }
         for i in self.used.drain(..) {
             self.keys[i] = EMPTY;
@@ -360,8 +360,8 @@ fn main() {
         let hs: Vec<_> = (0..nt).map(|_| {
             let (fwd, bwd, pairs, next) = (&fwd, &bwd, &pairs, &next);
             sc.spawn(move || {
-                let mut f = Side { g: fwd, dist: Map::new(16), heap: BinaryHeap::new() };
-                let mut b = Side { g: bwd, dist: Map::new(16), heap: BinaryHeap::new() };
+                let mut f = Side { g: fwd, dist: Map::new(12), heap: BinaryHeap::new() };
+                let mut b = Side { g: bwd, dist: Map::new(12), heap: BinaryHeap::new() };
                 let mut done = Vec::new();
                 loop {
                     let i = next.fetch_add(1, Relaxed);
