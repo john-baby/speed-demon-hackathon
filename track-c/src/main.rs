@@ -25,6 +25,19 @@ fn load(path: &str) -> &'static [u8] {
     std::fs::read(path).unwrap().leak()
 }
 
+// Map the page-cache pages of d[s..e] in one call rather than one fault per few pages while parsing.
+#[cfg(unix)]
+fn populate(d: &[u8], s: usize, e: usize) {
+    extern "C" {
+        fn madvise(addr: *const u8, len: usize, advice: i32) -> i32;
+    }
+    let a = s & !4095;
+    unsafe { madvise(d.as_ptr().add(a), e - a, 22) }; // MADV_POPULATE_READ; an old kernel just refuses
+}
+
+#[cfg(not(unix))]
+fn populate(_: &[u8], _: usize, _: usize) {}
+
 const BOM: &[u8] = b"\xef\xbb\xbf";
 const NONE: u16 = u16::MAX;
 
@@ -315,18 +328,7 @@ fn money(c: i64) -> String {
     format!("{}{}.{:02}", if c < 0 { "-" } else { "" }, c.abs() / 100, c.abs() % 100)
 }
 
-static PROF: std::sync::Mutex<Vec<(usize, u128, u128, u128, i32, i32)>> = std::sync::Mutex::new(Vec::new());
-#[cfg(unix)]
-extern "C" {
-    fn sched_getcpu() -> i32;
-    fn munmap(addr: *const u8, len: usize) -> i32;
-}
-#[cfg(not(unix))]
-unsafe fn sched_getcpu() -> i32 { -1 }
 fn main() {
-    let t0 = std::time::Instant::now();
-    let mut marks = String::new();
-    let us = |t: std::time::Instant| t.elapsed().as_micros();
     let args: Vec<String> = std::env::args().collect();
     let data_dir = args.get(1).map_or("/data", |s| s.as_str());
     let out_dir = args.get(2).map_or("/out", |s| s.as_str());
@@ -367,7 +369,6 @@ fn main() {
     }
     let unmatched = codes.len();
 
-    marks += &format!("_rg{}", us(t0));
     // 2. Split records.csv at record starts. Notes are lowercase words and quotes and names never
     //    hold an LF, so an LF followed by a digit or a BOM always ends a record.
     let d = load(&format!("{data_dir}/records.csv"));
@@ -385,7 +386,6 @@ fn main() {
     }
     starts.push(d.len());
 
-    marks += &format!("_sp{}", us(t0));
     // 3. Parse and aggregate every chunk in parallel, all threads sharing one name table, in rounds
     //    of about ROUND bytes per thread so the buckets stay in cache.
     let groups = unmatched + 1;
@@ -408,34 +408,24 @@ fn main() {
             let (s, e, ctx, buckets, barrier) = (starts[t], starts[t + 1], &ctx, &buckets, &barrier);
             sc.spawn(move || {
                 let empty = Agg { count: 0, id_sum: 0, amount_sum: 0, min: i64::MAX, max: i64::MIN, name_bytes: 0, note_bytes: 0 };
+                populate(d, s, e);
                 let mut chunk = Chunk { f: Fields::new(d, s), p: s, end: e, aggs: vec![empty; groups] };
                 // This thread's group masks: those of slots lo..hi.
                 let (lo, hi) = (((t << NAME_BITS) + nt - 1) / nt, (((t + 1) << NAME_BITS) + nt - 1) / nt);
                 let mut masks = vec![[0u64; 4]; hi - lo];
-                let cpu0 = unsafe { sched_getcpu() };
-                let (mut rn, mut ow, mut bw) = (0, 0, 0);
                 for r in 0..rounds {
                     let out = unsafe { &mut *buckets[t].0.get() };
                     out.iter_mut().for_each(Vec::clear);
-                    let ta = std::time::Instant::now();
                     chunk.run(ctx, s + (e - s) * (r + 1) / rounds, out);
-                    rn += us(ta);
-                    let ta = std::time::Instant::now();
                     barrier.wait();
-                    bw += us(ta);
-                    let ta = std::time::Instant::now();
                     for b in buckets {
                         for &x in &unsafe { &*b.0.get() }[t] {
                             let (i, g) = ((x >> 8) as usize - lo, (x & 255) as usize);
                             masks[i][g / 64] |= 1 << (g % 64);
                         }
                     }
-                    ow += us(ta);
-                    let ta = std::time::Instant::now();
                     barrier.wait();
-                    bw += us(ta);
                 }
-                PROF.lock().unwrap().push((t, rn, ow, bw, cpu0, unsafe { sched_getcpu() }));
                 // 4. Each group's distinct names are the masks with its bit set.
                 let mut c = vec![0i64; groups];
                 for m in &masks {
@@ -452,17 +442,6 @@ fn main() {
         }).collect();
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
-    marks += &format!("_pa{}", us(t0));
-    {
-        let v = PROF.lock().unwrap();
-        let f = |k: usize| { let x: Vec<u128> = v.iter().map(|e| [e.1, e.2, e.3][k]).collect(); (x.iter().min().copied().unwrap_or(0), x.iter().max().copied().unwrap_or(0)) };
-        let ((a, b), (c, d2), (e, g)) = (f(0), f(1), f(2));
-        marks += &format!("_nt{nt}_run{a}-{b}_own{c}-{d2}_bar{e}-{g}_cpu");
-        let mut cpus: Vec<i32> = v.iter().flat_map(|e| [e.4, e.5]).collect();
-        cpus.sort();
-        cpus.dedup();
-        marks += &cpus.iter().map(|c| c.to_string()).collect::<Vec<_>>().join("-");
-    }
     let counts: Vec<&Vec<i64>> = parts.iter().map(|p| &p.1).collect();
     let parts: Vec<&Vec<Agg>> = parts.iter().map(|p| &p.0).collect();
     let distinct: Vec<i64> = (0..groups).map(|g| counts.iter().map(|c| c[g]).sum()).collect();
@@ -487,10 +466,4 @@ fn main() {
         writeln!(o, "{key} {} {} {} {} {} {} {} {}", a.count, a.id_sum, money(a.amount_sum), money(a.min), money(a.max), distinct[g], a.name_bytes, a.note_bytes).unwrap();
     }
     std::fs::write(format!("{out_dir}/aggregates.txt"), o).unwrap();
-    marks += &format!("_wr{}", us(t0));
-    let ta = std::time::Instant::now();
-    #[cfg(unix)]
-    unsafe { munmap(d.as_ptr(), d.len()); }
-    marks += &format!("_um{}", us(ta));
-    std::fs::write(format!("{out_dir}/prof{marks}_end{}", us(t0)), b"").unwrap();
 }
