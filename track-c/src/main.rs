@@ -70,6 +70,7 @@ fn num(d: &[u8], p: &mut usize) -> i64 {
 // The commas and LFs outside quotes, in file order, found 64 bytes at a time. A byte is inside
 // quotes when an odd number of quotes precede it, so a running XOR over the block's quote mask (with
 // the carry from the block before) marks the quoted bytes; "" escapes cancel themselves out.
+#[derive(Clone, Copy)]
 struct Fields<'a> {
     d: &'a [u8],
     block: usize,  // start of the current 64-byte block
@@ -130,8 +131,13 @@ fn mask(s: &[u8], b: u8) -> u64 {
     m
 }
 
-fn digits(d: &[u8]) -> i64 {
-    d.iter().fold(0, |x, &b| x * 10 + (b - b'0') as i64)
+// The 1 to 8 digits in d[s..e], without a loop: one 8-byte load ending at e, the bytes before s
+// masked off, then digit pairs, quads and octets combined by multiplies.
+fn digits(d: &[u8], s: usize, e: usize) -> i64 {
+    let x = (u64::from_le_bytes(d[e - 8..e].try_into().unwrap()) ^ 0x3030_3030_3030_3030) & u64::MAX << (8 * (8 - (e - s)));
+    let x = (x.wrapping_mul(10) + (x >> 8)) & 0x00ff_00ff_00ff_00ff;
+    let x = (x.wrapping_mul(100) + (x >> 16)) & 0x0000_ffff_0000_ffff;
+    ((x.wrapping_mul(10000) + (x >> 32)) & 0xffff_ffff) as i64
 }
 
 #[derive(Clone, Copy)]
@@ -180,9 +186,13 @@ struct Lookup {
 
 impl Names {
     fn lookup(&self, d: &[u8], s: usize, len: usize) -> Lookup {
+        // Three word loads masked to the name's length; only a name in the file's last 24 bytes is copied.
         let mut b = [0u8; 24];
-        b[..len.min(24)].copy_from_slice(&d[s..s + len.min(24)]);
-        let key: [u64; 3] = std::array::from_fn(|i| u64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().unwrap()));
+        let src = if s + 24 <= d.len() { &d[s..s + 24] } else { b[..d.len() - s].copy_from_slice(&d[s..]); &b };
+        let key: [u64; 3] = std::array::from_fn(|k| {
+            let n = len.saturating_sub(8 * k);
+            u64::from_le_bytes(src[8 * k..8 * k + 8].try_into().unwrap()) & if n >= 8 { !0 } else { !(!0 << (8 * n)) }
+        });
         let h = (key[0] ^ key[1].rotate_left(21) ^ key[2].rotate_left(42) ^ len as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
         let i = (h >> (64 - NAME_BITS)) as usize;
         prefetch(&self.slots[i]);
@@ -190,6 +200,7 @@ impl Names {
     }
 
     // The name's slot, inserting it if new.
+    #[inline(always)]
     fn slot(&self, d: &[u8], l: &Lookup) -> usize {
         let Lookup { s, len, key, mut i } = *l;
         let entry = (s as u64) << 32 | (len as u64 + 1);
@@ -245,9 +256,10 @@ impl<'a> Chunk<'a> {
     // Parse the records starting before `until` (record starts are outside quotes) and aggregate them
     // by group: rank[code_of[region_id]] is the region's group, and a missing region is `unmatched`.
     fn run(&mut self, c: &Ctx, until: usize, out: &mut [Vec<u32>]) {
-        let (d, nt) = (c.d, out.len());
+        let d = c.d;
         let mut pending = None;
-        let mut finish = |aggs: &mut [Agg], (l, region, id, cents, name_bytes, bytes): (Lookup, usize, i64, i64, usize, i64)| {
+        #[inline(always)]
+        fn finish(c: &Ctx, aggs: &mut [Agg], out: &mut [Vec<u32>], (l, region, id, cents, name_bytes, bytes): (Lookup, usize, i64, i64, usize, i64)) {
             let g = c.code_of.get(region).filter(|&&k| k != NONE).map_or(c.unmatched, |&k| c.rank[k as usize] as usize);
             let a = &mut aggs[g];
             a.count += 1;
@@ -257,25 +269,25 @@ impl<'a> Chunk<'a> {
             a.max = a.max.max(cents);
             a.name_bytes += name_bytes as i64;
             a.note_bytes += bytes - name_bytes as i64;
-            let i = c.names.slot(d, &l);
-            out[i * nt >> NAME_BITS].push((i as u32) << 8 | g as u32);
-        };
+            let i = c.names.slot(c.d, &l);
+            out[i * out.len() >> NAME_BITS].push((i as u32) << 8 | g as u32);
+        }
         // A field of n bytes holding q quote bytes is a value of n bytes when q is 0, and of
         // n - 1 - q/2 bytes when quoted: two delimiting quotes and one byte saved per "" escape.
         let value_len = |n: usize, q: usize| if q == 0 { n } else { n - 1 - q / 2 };
-        let (f, mut p) = (&mut self.f, self.p);
+        let (mut f, mut p) = (self.f, self.p);
         let until = until.min(self.end);
         while p < until {
             p += if d[p..].starts_with(BOM) { 3 } else { 0 };
             let ((c1, q1), (c2, q2), (c3, q3), (c4, _), (lf, _)) = (f.next(), f.next(), f.next(), f.next(), f.next());
-            let id = digits(&d[p..c1]);
+            let id = digits(d, p, c1);
             let name = if q2 > q1 { &d[c1 + 2..c2 - 1] } else { &d[c1 + 1..c2] };
             let name_len = value_len(c2 - c1 - 1, q2 - q1);
             let note_len = value_len(c3 - c2 - 1, q3 - q2);
-            let region = digits(&d[c3 + 1..c4]) as usize;
-            let amount = &d[c4 + 1..lf - (d[lf - 1] == b'\r') as usize];
-            let negative = amount[0] == b'-';
-            let cents = (digits(&amount[negative as usize..amount.len() - 3]) * 100 + digits(&amount[amount.len() - 2..])) * if negative { -1 } else { 1 };
+            let region = digits(d, c3 + 1, c4) as usize;
+            let end = lf - (d[lf - 1] == b'\r') as usize;
+            let negative = d[c4 + 1] == b'-';
+            let cents = (digits(d, c4 + 1 + negative as usize, end - 3) * 100 + digits(d, end - 2, end)) * if negative { -1 } else { 1 };
             p = lf + 1;
 
             // Finish the previous record while this one's region and name lines are on their way in.
@@ -284,13 +296,13 @@ impl<'a> Chunk<'a> {
             }
             let l = c.names.lookup(d, name.as_ptr() as usize - d.as_ptr() as usize, name.len());
             if let Some(prev) = pending.replace((l, region, id, cents, name_len, (name_len + note_len) as i64)) {
-                finish(&mut self.aggs, prev);
+                finish(c, &mut self.aggs, out, prev);
             }
         }
         if let Some(prev) = pending {
-            finish(&mut self.aggs, prev);
+            finish(c, &mut self.aggs, out, prev);
         }
-        self.p = p;
+        (self.f, self.p) = (f, p);
     }
 }
 
