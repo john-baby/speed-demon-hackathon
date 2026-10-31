@@ -6,8 +6,8 @@ The task, the input files and the exact output format are in the [spec](https://
 
 Rust, standard library only, one binary (`src/main.rs`).
 
-1. **Regions first.** `regions.csv` is plain, so it is parsed straight into an array indexed by `region_id`. Each slot holds the region's group, which is the rank of its country code in sorted order. Groups are therefore already in output order, and `_UNMATCHED` (which sorts last) is simply the next index. An id outside the array, or a hole in it, maps to `_UNMATCHED`.
-2. **Split a hostile CSV safely.** Each quoted field contributes an even number of `"` bytes (two delimiters plus `""` escapes in pairs). So a byte is inside quotes exactly when an odd number of `"` bytes come before it. One parallel pass counts the quotes in each of N equal byte ranges. The running parity then says, for each cut, whether it falls inside a quoted field. From each cut, a short walk finds the first LF outside quotes, and the next record starts there. This holds even when a cut lands inside a multi-line note.
+1. **Regions in parallel.** `regions.csv` is plain, so it is mapped and cut into one range of lines per core. The threads fill `code_of[region_id]`, the region's country code as a number below 26^3, writing disjoint ids. A 26^3 table then gives each code present its rank in sorted order, which is its group. Groups are therefore already in output order, and `_UNMATCHED` (which sorts last) is simply the next index. An id beyond the array, or a hole in it, maps to `_UNMATCHED`.
+2. **Split a hostile CSV without tracking quotes.** The spec (section 2.2) guarantees that notes are lowercase words and quotes and that names never hold an LF. So an LF inside a quoted field is never followed by a digit, and an LF followed by a digit or a BOM always ends a record. Each thread starts at an equal byte cut and walks to the first such LF; this holds even when the cut lands inside a multi-line note.
 3. **Parse without copying.** Each thread walks its records:
    - a BOM is skipped only at the start of a record;
    - integers and amounts are read as exact integer cents;

@@ -26,6 +26,22 @@ fn load(path: &str) -> &'static [u8] {
 }
 
 const BOM: &[u8] = b"\xef\xbb\xbf";
+const NONE: u16 = u16::MAX;
+
+// The first line start at or after byte i of an LF-terminated file.
+fn line_start(d: &[u8], i: usize) -> usize {
+    if i == 0 || d[i - 1] == b'\n' { i } else { find(d, i, b'\n') + 1 }
+}
+
+#[derive(Clone, Copy)]
+struct Shared(*mut u16);
+unsafe impl Send for Shared {}
+unsafe impl Sync for Shared {}
+impl Shared {
+    fn at(self, i: usize) -> *mut u16 {
+        unsafe { self.0.add(i) }
+    }
+}
 
 // Index of the first `b` at or after `i`, 8 bytes at a time.
 fn find(d: &[u8], mut i: usize, b: u8) -> usize {
@@ -145,8 +161,8 @@ impl Names {
 }
 
 // Parse the records in d[start..end] (start is a record start, outside quotes) and aggregate them
-// by group: region_of[region_id] is the region's group, and a missing region is group `unmatched`.
-fn parse(d: &[u8], start: usize, end: usize, region_of: &[u16], unmatched: usize, names: &Names) -> Vec<Agg> {
+// by group: rank[code_of[region_id]] is the region's group, and a missing region is group `unmatched`.
+fn parse(d: &[u8], start: usize, end: usize, code_of: &[u16], rank: &[u16], unmatched: usize, names: &Names) -> Vec<Agg> {
     let empty = Agg { count: 0, id_sum: 0, amount_sum: 0, min: i64::MAX, max: i64::MIN, name_bytes: 0, note_bytes: 0 };
     let mut aggs = vec![empty; unmatched + 1];
     let mut p = start;
@@ -165,7 +181,7 @@ fn parse(d: &[u8], start: usize, end: usize, region_of: &[u16], unmatched: usize
         p += 2;
         p += if d.get(p) == Some(&b'\r') { 2 } else { 1 };
 
-        let g = region_of.get(region).map_or(unmatched, |&g| g as usize);
+        let g = code_of.get(region).filter(|&&c| c != NONE).map_or(unmatched, |&c| rank[c as usize] as usize);
         let a = &mut aggs[g];
         a.count += 1;
         a.id_sum += id;
@@ -189,56 +205,55 @@ fn main() {
     let out_dir = args.get(2).map_or("/out", |s| s.as_str());
     let nt = thread::available_parallelism().map_or(1, |n| n.get());
 
-    // 1. Regions: group = rank of the country code; a region id not listed maps to `unmatched`.
-    let r = std::fs::read(format!("{data_dir}/regions.csv")).unwrap();
-    let mut rows = Vec::new();
-    let mut p = find(&r, 0, b'\n') + 1;
-    while p < r.len() {
-        let id = num(&r, &mut p) as usize;
-        rows.push((id, &r[p..p + 3]));
-        p += 4;
-    }
-    let code = |c: &[u8]| ((c[0] - b'A') as usize * 26 + (c[1] - b'A') as usize) * 26 + (c[2] - b'A') as usize;
-    let mut rank = vec![0u16; 26 * 26 * 26];
-    for &(_, c) in &rows {
-        rank[code(c)] = 1;
-    }
+    // 1. Regions, in parallel: code_of[region_id] is the region's country code as a number below
+    //    26^3, and rank[code] its group (the code's place in sorted order); the threads fill
+    //    disjoint ids. A region id not listed maps to `unmatched`.
+    let r = load(&format!("{data_dir}/regions.csv"));
+    let body = find(r, 0, b'\n') + 1;
+    let mut p = r[..r.len() - 1].iter().rposition(|&b| b == b'\n').map_or(0, |x| x + 1).max(body);
+    let mut code_of = vec![NONE; if p < r.len() { num(r, &mut p) as usize + 1 } else { 0 }];
+    let out = Shared(code_of.as_mut_ptr());
+    let present: Vec<[bool; 17576]> = thread::scope(|sc| {
+        let hs: Vec<_> = (0..nt).map(|i| {
+            let (mut p, end) = (line_start(r, body + (r.len() - body) * i / nt), line_start(r, body + (r.len() - body) * (i + 1) / nt));
+            sc.spawn(move || {
+                let mut seen = [false; 17576];
+                while p < end {
+                    let id = num(r, &mut p);
+                    let c = ((r[p] - b'A') as usize * 26 + (r[p + 1] - b'A') as usize) * 26 + (r[p + 2] - b'A') as usize;
+                    seen[c] = true;
+                    unsafe { *out.at(id as usize) = c as u16 };
+                    p += 4;
+                }
+                seen
+            })
+        }).collect();
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    let mut rank = vec![0u16; 17576];
     let mut codes = Vec::new();
     for (k, r) in rank.iter_mut().enumerate() {
-        if *r == 1 {
+        if present.iter().any(|s| s[k]) {
             *r = codes.len() as u16;
             codes.push([b'A' + (k / 676) as u8, b'A' + (k / 26 % 26) as u8, b'A' + (k % 26) as u8]);
         }
     }
     let unmatched = codes.len();
-    let mut region_of = vec![unmatched as u16; rows.iter().map(|&(id, _)| id + 1).max().unwrap_or(0)];
-    for &(id, c) in &rows {
-        region_of[id] = rank[code(c)];
-    }
 
-    // 2. Split records.csv at record starts. A byte is inside quotes exactly when an odd number of
-    //    quotes precede it ("" escapes come in pairs), so count each chunk's quotes in parallel,
-    //    then walk from each cut to the first LF outside quotes.
+    // 2. Split records.csv at record starts. Notes are lowercase words and quotes and names never
+    //    hold an LF, so an LF followed by a digit or a BOM always ends a record.
     let d = load(&format!("{data_dir}/records.csv"));
-    let cuts: Vec<usize> = (0..=nt).map(|i| d.len() * i / nt).collect();
-    let quotes: Vec<usize> = thread::scope(|sc| {
-        let hs: Vec<_> = (0..nt).map(|i| {
-            let part = &d[cuts[i]..cuts[i + 1]];
-            sc.spawn(move || part.chunks(255).map(|c| c.iter().fold(0u8, |n, &b| n + (b == b'"') as u8) as usize).sum::<usize>())
-        }).collect();
-        hs.into_iter().map(|h| h.join().unwrap()).collect()
-    });
     let header = d.strip_prefix(BOM).map_or(0, |_| 3);
     let mut starts = vec![find(d, header, b'\n') + 1];
-    let mut parity = 0;
     for i in 1..nt {
-        parity += quotes[i - 1];
-        let (mut x, mut inside) = (cuts[i], parity % 2 == 1);
-        while x < d.len() && (inside || d[x] != b'\n') {
-            inside ^= d[x] == b'"';
-            x += 1;
+        let mut x = (d.len() * i / nt).max(starts[i - 1]);
+        while x < d.len() {
+            x = find(d, x, b'\n') + 1;
+            if x == d.len() || d[x].is_ascii_digit() || d[x] == BOM[0] {
+                break;
+            }
         }
-        starts.push((x + 1).min(d.len()).max(starts[i - 1]));
+        starts.push(x.min(d.len()));
     }
     starts.push(d.len());
 
@@ -250,8 +265,8 @@ fn main() {
     };
     let parts: Vec<Vec<Agg>> = thread::scope(|sc| {
         let hs: Vec<_> = (0..nt).map(|i| {
-            let (s, e, region_of, names) = (starts[i], starts[i + 1], &region_of, &names);
-            sc.spawn(move || parse(d, s, e, region_of, unmatched, names))
+            let (s, e, code_of, rank, names) = (starts[i], starts[i + 1], &code_of, &rank, &names);
+            sc.spawn(move || parse(d, s, e, code_of, rank, unmatched, names))
         }).collect();
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
