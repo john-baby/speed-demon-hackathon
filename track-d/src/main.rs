@@ -302,31 +302,66 @@ fn main() {
     bounds.push(body.len());
     let chunks: Vec<&[u8]> = (0..nt).map(|i| &body[bounds[i]..bounds[i + 1]]).collect();
 
-    // 1. Count out-degrees in parallel.
-    let outs: Vec<AtomicU32> = (0..=n).map(|_| AtomicU32::new(0)).collect();
-    thread::scope(|sc| {
-        for c in &chunks {
-            let outs = &outs;
-            sc.spawn(move || each_edge(c, |u, _, _| {
-                outs[u].fetch_add(1, Relaxed);
-            }));
-        }
+    // 1. Parse each chunk once, sending every edge to the thread that owns its tail: thread t owns
+    //    nodes lo(t)..lo(t + 1).
+    let lo = |t: usize| (n * t).div_ceil(nt);
+    let owner = |u: usize| u * nt / n;
+    let buckets: Vec<Vec<Vec<[u32; 3]>>> = thread::scope(|sc| {
+        let hs: Vec<_> = chunks.iter().map(|c| sc.spawn(move || {
+            let mut out: Vec<Vec<[u32; 3]>> = (0..nt).map(|_| Vec::with_capacity(c.len() / 18 / nt + 64)).collect();
+            each_edge(c, |u, v, w| out[owner(u)].push([u as u32, v as u32, w]));
+            out
+        })).collect();
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
 
-    // 2. Parse again and place every edge in the forward graph.
-    let fo = offsets(&outs);
-    let m = fo[n] as usize;
-    let mut fwd = Graph { off: fo, adj: vec![[0; 2]; m] };
-    let fa = Shared(fwd.adj.as_mut_ptr());
+    // 2. Each owner counts its nodes' out-degrees and places their edges in the forward graph; only
+    //    the start of each owner's range in adj needs the others' totals.
+    let mut off = vec![0u32; n + 1];
+    let fo = Shared(off.as_mut_ptr());
+    let totals: Vec<u32> = thread::scope(|sc| {
+        let hs: Vec<_> = (0..nt).map(|t| {
+            let buckets = &buckets;
+            sc.spawn(move || {
+                let (a, b) = (lo(t), lo(t + 1));
+                let off = unsafe { std::slice::from_raw_parts_mut(fo.at(a), b - a) };
+                for e in buckets.iter().flat_map(|out| &out[t]) {
+                    off[e[0] as usize - a] += 1;
+                }
+                let mut total = 0;
+                for o in off.iter_mut() {
+                    (*o, total) = (total, total + *o);
+                }
+                total
+            })
+        }).collect();
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    let base: Vec<u32> = totals.iter().scan(0, |acc, &x| { let b = *acc; *acc += x; Some(b) }).collect();
+    let m = totals.iter().sum::<u32>();
+    off[n] = m;
+    let mut adj = vec![[0u32; 2]; m as usize];
+    let fa = Shared(adj.as_mut_ptr());
     thread::scope(|sc| {
-        for c in &chunks {
-            let outs = &outs;
-            sc.spawn(move || each_edge(c, |u, v, w| unsafe {
-                *fa.at(outs[u].fetch_add(1, Relaxed) as usize) = [v as u32, w];
-            }));
+        for t in 0..nt {
+            let (buckets, base) = (&buckets, base[t]);
+            sc.spawn(move || {
+                let (a, b) = (lo(t), lo(t + 1));
+                let off = unsafe { std::slice::from_raw_parts_mut(fo.at(a), b - a) };
+                let mut next: Vec<u32> = off.to_vec();
+                for e in buckets.iter().flat_map(|out| &out[t]) {
+                    let x = &mut next[e[0] as usize - a];
+                    unsafe { *fa.at((base + *x) as usize) = [e[1], e[2]] };
+                    *x += 1;
+                }
+                for o in off.iter_mut() {
+                    *o += base;
+                }
+            });
         }
     });
-    drop(outs);
+    drop(buckets);
+    let fwd = Graph { off, adj };
 
     // 3. Renumber nodes so a search walks nearby memory: every thread grows breadth-first regions
     //    from seeds in its own id range, claiming nodes with an atomic flag, and the threads'
