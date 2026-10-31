@@ -286,8 +286,13 @@ fn main() {
     // 3. Parse and aggregate every chunk in parallel, all threads sharing one name table.
     let groups = unmatched + 1;
     assert!(groups <= 256, "group masks hold 256 groups");
+    // All-zero is an empty slot, so take zeroed pages from the allocator rather than writing 8 MB
+    // on one thread; the parsing threads fault them in as they touch them.
     let names = Names {
-        slots: (0..1 << NAME_BITS).map(|_| Slot { entry: AtomicU64::new(0), key: Default::default(), mask: Default::default() }).collect(),
+        slots: unsafe {
+            let n = 1 << NAME_BITS;
+            Vec::from_raw_parts(std::alloc::alloc_zeroed(std::alloc::Layout::array::<Slot>(n).unwrap()) as *mut Slot, n, n)
+        },
     };
     let parts: Vec<Vec<Agg>> = thread::scope(|sc| {
         let hs: Vec<_> = (0..nt).map(|i| {
