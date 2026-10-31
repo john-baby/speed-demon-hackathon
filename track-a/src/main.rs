@@ -30,20 +30,6 @@ fn load(path: &str) -> &'static [u8] {
     std::fs::read(path).unwrap().leak()
 }
 
-// Map a thread's whole chunk in one call (MADV_POPULATE_READ, Linux 5.14+) instead of a page
-// fault per few pages; on older kernels it fails harmlessly.
-#[cfg(unix)]
-fn populate(part: &[u8]) {
-    extern "C" {
-        fn madvise(addr: *const u8, len: usize, advice: i32) -> i32;
-    }
-    let skip = part.as_ptr() as usize % 4096;
-    unsafe { madvise(part.as_ptr().wrapping_sub(skip), part.len() + skip, 22) };
-}
-
-#[cfg(not(unix))]
-fn populate(_: &[u8]) {}
-
 fn word(d: &[u8], i: usize) -> u64 {
     u64::from_le_bytes(d[i..i + 8].try_into().unwrap())
 }
@@ -268,10 +254,7 @@ fn main() {
     let chunks: Vec<Chunk> = thread::scope(|sc| {
         let hs: Vec<_> = (0..nt).map(|i| {
             let part = &d[bounds[i]..bounds[i + 1]];
-            sc.spawn(move || {
-                populate(part);
-                parse(part)
-            })
+            sc.spawn(move || parse(part))
         }).collect();
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
@@ -348,4 +331,6 @@ fn main() {
             });
         }
     });
+    // Everything is written: leave without freeing the arenas and tables one by one.
+    std::process::exit(0);
 }

@@ -14,6 +14,10 @@ Every step from the reference to your final version, each with the live-board ru
 | 7 | Parse split into 8 pieces per thread: each thread parses its own run of consecutive pieces, then takes what is left of the others' runs, so a slower core (E-core or busy hyperthread sibling) would not set the parse time. Reverted: no faster on the board, and S rose from 356 to 368 | run-c99b5470bebc | 0.038 | 38.7 | 74.7 |
 | 8 | Step 6's code with `prctl(PR_SET_THP_DISABLE)` at start-up, testing whether transparent huge pages rounded each thread's small allocations up to 2 MB of resident memory. Reverted: M did not move (39.0 MB), so huge pages are not the gap | run-2eaa07b81361 | 0.041 | 39.0 | 73.9 |
 | 9 | Step 6's code again | run-28c2bb62235e | 0.037 | 38.7 | 75.2 |
+| 10 | End the process with `exit(0)` as soon as the last hour is written, so the 12 arenas, rows and tables are not freed one by one | run-f936ad888b44 | 0.036 | 38.9 | 75.3 |
+| 11 | Half as many threads (6). Reverted | run-0433348c397c | 0.040 | 34.5 | 74.6 |
+| 12 | Twice as many threads (24). Reverted | run-241312202592 | 0.061 | 45.7 | 69.0 |
+| 13 | Each parse thread maps its share of the input with `madvise(MADV_POPULATE_READ)` before parsing. Reverted | run-700456b623f3 | 0.046 | 39.2 | 72.6 |
 
 ## Notes
 
@@ -33,3 +37,5 @@ Every step from the reference to your final version, each with the live-board ru
 - One thread's select phase (about 45 ms on the laptop): selection about 19 ms, the file write about 7 ms, gathering, probing and formatting about 20 ms. Without huge pages to blame, the remaining memory is the arena (about 15 MB, 12.4 MB of it latencies) plus about 0.5 MB per thread of name tables and group rows, plus the process baseline.
 - Memory accounting after step 9 (laptop, 12 threads, 3.1M-line file): our own peak is about 27 MiB. Latency blocks take 14.2 MiB (11.8 MiB of it data), chain links 1.8, group rows 2.2, per-thread name tables 3.9, and the select phase's output and scratch about 3. The board's 38.7 MB is about 10 MB above that, which matches the 10.1 MB output file (whose page cache is likely charged to the container) plus about 1.5 MB of process baseline. The same model fits step 4 (about 40 MB allocated plus 10, against 51.7 measured).
 - Memory cuts considered after step 9 and not made, because each saves 1-5 MB (+0.2 to +0.5 points) for a time or code cost. Freeing the name tables before the select phase: 0-3 MB on the laptop. 3-byte latencies with an overflow list: 3.5 MB. One exact-offset latency array: needs a counting pass, about +30% time. 16-bit latency codes with a second pass for exact values: a full second parse.
+- Board profile before step 10 (run-8179f165c211, instrumented, fails the output check on purpose): parse done at 26.7 ms, rank at 27.9 ms, select and write at 35.8 ms, freeing everything took 2.0 ms more. Per-thread parse time ranged 11.6-26.0 ms and thread start times spread over 4.6 ms. Step 10 removes the 2 ms of freeing; steps 11-13 tested the uneven parse and were all slower. The current code is step 10.
+- Late on Oct 31 the board's timings became much noisier (track C's unchanged code measured 0.048, 0.051 and 0.071 s), so steps after 10 were judged only where the difference was large.

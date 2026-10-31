@@ -16,6 +16,10 @@ Every step from the reference to your final version, each with the live-board ru
 | 9 | AVX2 masks, delimiters scanned a 64 KB stretch ahead into a position array (one hard-to-predict branch per 64-byte block rather than per field), and numbers parsed without loops (one 8-byte load, digit pairs combined by multiplies). Reverted: no faster on the board, and S rose from 516 to 573 | run-739ff375d24e | 0.063 | 17.7 | 66.7 |
 | 10 | Step 8's code again. Steps 8 and 10 are the same build, so 0.060 s to 0.062 s is the board's run-to-run spread | run-030a52ef2645 | 0.062 | 17.5 | 67.4 |
 | 11 | Tighter record loop: numbers parsed from one masked 8-byte load ending at the field's end, digit pairs combined by multiplies; a name's key built from three masked word loads instead of a copy; the per-record finishing step inlined and the scanner state kept in locals, so the loop no longer copies a record tuple through the stack or reloads its state from memory | run-87949b19dc88 | 0.048 | 17.0 | 70.2 |
+| 12 | `exit(0)` right after writing the output, so no destructors run. Not kept: 0.0517 s and 0.0515 s (run-881358ff5946) against 0.0509 s for step 11 measured in between (run-ca66c0a751e8) | run-9356ca046175 | 0.052 | 17.2 | 69.3 |
+| 13 | Each thread maps its share of the file with `madvise(MADV_POPULATE_READ)` before parsing. Reverted | run-3e55edd37b4d | 0.058 | 16.3 | 68.2 |
+| 14 | Half as many threads (6). Reverted | run-551f7fb4ea50 | 0.084 | 14.3 | 64.8 |
+| 15 | Twice as many threads (24). Reverted | run-c9fcf1def886 | 0.056 | 19.5 | 67.8 |
 
 ## Notes
 
@@ -38,3 +42,5 @@ Every step from the reference to your final version, each with the live-board ru
 - Ablations at 8 threads on the laptop: removing all name work took the parse from 85-90 ms to 54-59 ms (probing about 12-15 ms, slot access, bucket push and owner masks about 10 ms, hashing about 10 ms).
 - After step 11, 8 threads on the laptop (parse phase, interleaved A/B): baseline 72.6-74 ms; without the owners' mask writes 63-69 ms; without the bucket push 69-70.5 ms; without the name probe loop about 57-63 ms. The board profile puts the owner phase at only 2.7 ms, so what remains of the name cost is mostly the miss on the slot line.
 - Tried after step 11 and not kept, none measurably faster: an owner-side name table fed with the 24-byte keys (much slower, 209-241 ms against 141-163 ms in the same batch); a one-byte BOM check, unchecked number loads and the region's group stored directly in `code_of` (within noise); dropping the one-record deferral (slower, 64.8/83.9 ms against 62.3/72.8 ms min/median, so it stays). A tag-byte array was not built: the whole probe loop is worth at most about 6 ms of 72 ms on the laptop.
+- Board profile of step 11 (run-f68866234c17, instrumented): regions 1.9 ms, split 2.0 ms, parse phase done at 46.7 ms with per-thread parse time 32.9-37.3 ms, barrier waits 2.3-6.5 ms and owner work 2.1-2.6 ms. Explicitly unmapping the 200 MB input took 4.8 ms, which is most of the time previously seen outside `main` (normally paid at exit). Steps 12-15 tested the obvious levers and none helped, so the current code is step 11.
+- Late on Oct 31 the board's timings became much noisier: step 11's code measured 0.048 s, 0.051 s and 0.071 s (run-b5081feba568) on three runs.
