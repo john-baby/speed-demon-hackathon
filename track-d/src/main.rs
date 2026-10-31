@@ -135,32 +135,43 @@ fn transpose(g: &Graph, nt: usize) -> Graph {
 // costs, and memory what the search touches.
 const PAGE: usize = 1024;
 
-struct Map {
+struct Map<V> {
     dir: Vec<u32>, // page index + 1 for each block of ids, 0 = none
-    pages: Vec<[u64; PAGE]>,
+    pages: Vec<[V; PAGE]>,
     used: usize,
     blocks: Vec<u32>,
 }
 
-impl Map {
-    fn new(n: usize) -> Map {
+// A stored distance; NONE marks a node not reached.
+trait Dist: Copy + Eq {
+    const NONE: Self;
+}
+impl Dist for u32 {
+    const NONE: u32 = u32::MAX;
+}
+impl Dist for u64 {
+    const NONE: u64 = u64::MAX;
+}
+
+impl<V: Dist> Map<V> {
+    fn new(n: usize) -> Self {
         Map { dir: vec![0; n.div_ceil(PAGE)], pages: Vec::new(), used: 0, blocks: Vec::new() }
     }
 
-    fn get(&self, k: u32) -> u64 {
+    fn get(&self, k: u32) -> V {
         match self.dir[k as usize / PAGE] {
-            0 => u64::MAX,
+            0 => V::NONE,
             p => self.pages[p as usize - 1][k as usize % PAGE],
         }
     }
 
-    fn set(&mut self, k: u32, v: u64) {
+    fn set(&mut self, k: u32, v: V) {
         let b = k as usize / PAGE;
         if self.dir[b] == 0 {
             if self.used == self.pages.len() {
-                self.pages.push([u64::MAX; PAGE]);
+                self.pages.push([V::NONE; PAGE]);
             } else {
-                self.pages[self.used] = [u64::MAX; PAGE];
+                self.pages[self.used] = [V::NONE; PAGE];
             }
             self.used += 1;
             self.dir[b] = self.used as u32;
@@ -179,17 +190,28 @@ impl Map {
     }
 }
 
-// A heap entry: a tentative distance and its node, ordered by distance. Most searches use one u64,
-// distance << 21 | node, which is half the size and compares in one instruction; a search whose
-// distances outgrow 43 bits is run again with plain pairs.
+// A heap entry: a tentative distance and its node, ordered by distance, and how distances are
+// stored. Most searches use one u64, distance << 21 | node, which is half the size and compares in
+// one instruction, and store distances as u32, halving the pages a search touches; a search whose
+// distances reach 2^32 - 1 is run again with plain pairs and u64 distances.
 trait Key: Ord + Copy {
+    type D: Dist;
     fn make(d: u64, u: u32) -> Option<Self>;
     fn split(self) -> (u64, u32);
+    fn store(d: u64) -> Self::D;
+    fn load(d: Self::D) -> u64; // u64::MAX for NONE
 }
 
 impl Key for u64 {
+    type D = u32;
     fn make(d: u64, u: u32) -> Option<u64> {
-        (d >> 43 == 0).then_some(d << 21 | u as u64)
+        (d < u32::MAX as u64).then_some(d << 21 | u as u64)
+    }
+    fn store(d: u64) -> u32 {
+        d as u32
+    }
+    fn load(d: u32) -> u64 {
+        if d == u32::MAX { u64::MAX } else { d as u64 }
     }
     fn split(self) -> (u64, u32) {
         (self >> 21, self as u32 & 0x1f_ffff)
@@ -197,8 +219,15 @@ impl Key for u64 {
 }
 
 impl Key for (u64, u32) {
+    type D = u64;
     fn make(d: u64, u: u32) -> Option<Self> {
         Some((d, u))
+    }
+    fn store(d: u64) -> u64 {
+        d
+    }
+    fn load(d: u64) -> u64 {
+        d
     }
     fn split(self) -> (u64, u32) {
         self
@@ -206,9 +235,9 @@ impl Key for (u64, u32) {
 }
 
 // One direction of a bidirectional Dijkstra search.
-struct Side<'g, K> {
+struct Side<'g, K: Key> {
     g: &'g Graph,
-    dist: Map,
+    dist: Map<K::D>,
     heap: BinaryHeap<Reverse<K>>,
 }
 
@@ -220,7 +249,7 @@ impl<'g, K: Key> Side<'g, K> {
     fn reset(&mut self, from: u32) {
         self.dist.clear();
         self.heap.clear();
-        self.dist.set(from, 0);
+        self.dist.set(from, K::store(0));
         self.heap.push(Reverse(K::make(0, from).unwrap()));
     }
 
@@ -228,7 +257,7 @@ impl<'g, K: Key> Side<'g, K> {
     fn top(&mut self) -> u64 {
         while let Some(&Reverse(k)) = self.heap.peek() {
             let (d, u) = k.split();
-            if d == self.dist.get(u) {
+            if d == K::load(self.dist.get(u)) {
                 return d;
             }
             self.heap.pop();
@@ -243,11 +272,11 @@ impl<'g, K: Key> Side<'g, K> {
         let g = self.g;
         for &[v, w] in &g.adj[g.off[u as usize] as usize..g.off[u as usize + 1] as usize] {
             let nd = d + w as u64;
-            if nd < self.dist.get(v) {
+            if nd < K::load(self.dist.get(v)) {
                 let Some(k) = K::make(nd, v) else { return false };
-                self.dist.set(v, nd);
+                self.dist.set(v, K::store(nd));
                 self.heap.push(Reverse(k));
-                let o = other.dist.get(v);
+                let o = K::load(other.dist.get(v));
                 if o != u64::MAX {
                     *best = (*best).min(nd + o);
                 }
