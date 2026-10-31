@@ -30,16 +30,36 @@ fn word(d: &[u8], i: usize) -> u64 {
     u64::from_le_bytes(d[i..i + 8].try_into().unwrap())
 }
 
+// Index of the first `b` at or after `i`, 8 bytes at a time.
+fn find(d: &[u8], mut i: usize, b: u8) -> usize {
+    while i + 8 <= d.len() {
+        let w = word(d, i) ^ (b as u64 * 0x0101_0101_0101_0101);
+        let z = w.wrapping_sub(0x0101_0101_0101_0101) & !w & 0x8080_8080_8080_8080;
+        if z != 0 {
+            return i + z.trailing_zeros() as usize / 8;
+        }
+        i += 8;
+    }
+    i + d[i..].iter().position(|&c| c == b).unwrap()
+}
+
+fn hour(d: &[u8], p: usize) -> usize {
+    let digit = |i: usize| (d[i] - b'0') as usize;
+    let day = digit(p + 8) * 10 + digit(p + 9);
+    (if day >= 30 { day - 30 } else { day + 1 }) * 24 + digit(p + 11) * 10 + digit(p + 12) - 18
+}
+
 // One thread's view of its chunk, with its own endpoint ids.
 struct Chunk<'a> {
-    recs: Vec<u64>,          // endpoint id << 40 | hour << 32 | latency
+    d: &'a [u8],
+    ids: Vec<u16>,           // endpoint id of every line
     tally: Vec<[u32; 2]>,    // [count, 5xx count] at id * HOURS + hour
     names: Vec<&'a [u8]>,
     slots: Vec<u32>,         // open addressing, id + 1, 0 = empty
 }
 
 impl<'a> Chunk<'a> {
-    fn id(&mut self, ep: &'a [u8], h: u64) -> u64 {
+    fn id(&mut self, ep: &'a [u8], h: u64) -> usize {
         let mask = self.slots.len() - 1;
         let mut i = (h >> 40) as usize & mask;
         loop {
@@ -48,22 +68,20 @@ impl<'a> Chunk<'a> {
                     self.names.push(ep);
                     self.tally.resize(self.names.len() * HOURS, [0; 2]);
                     self.slots[i] = self.names.len() as u32;
-                    return self.names.len() as u64 - 1;
+                    return self.names.len() - 1;
                 }
-                s if self.names[s as usize - 1] == ep => return s as u64 - 1,
+                s if self.names[s as usize - 1] == ep => return s as usize - 1,
                 _ => i = (i + 1) & mask,
             }
         }
     }
 }
 
+// Pass 1: intern each line's endpoint and count lines and 5xx per (endpoint, hour).
 fn parse(d: &[u8]) -> Chunk<'_> {
-    let mut c = Chunk { recs: Vec::with_capacity(d.len() / 70), tally: Vec::new(), names: Vec::new(), slots: vec![0; 1 << 14] };
-    let digit = |i: usize| (d[i] - b'0') as u64;
+    let mut c = Chunk { d, ids: Vec::with_capacity(d.len() / 60), tally: Vec::new(), names: Vec::new(), slots: vec![0; 1 << 14] };
     let mut p = 0;
     while p < d.len() {
-        let day = digit(p + 8) * 10 + digit(p + 9);
-        let hour = (if day >= 30 { day - 30 } else { day + 1 }) * 24 + digit(p + 11) * 10 + digit(p + 12) - 18;
         // Skip the method by its first letters: GET DELETE HEAD OPTIONS POST PUT PATCH.
         let s = p + match (d[p + 28], d[p + 29]) {
             (b'G', _) | (b'P', b'U') => 32,
@@ -72,40 +90,19 @@ fn parse(d: &[u8]) -> Chunk<'_> {
             (b'D', _) => 35,
             _ => 36,
         };
-        // Find the space after the endpoint 8 bytes at a time. At least " 100 0\n" follows
-        // the endpoint's first byte, so an 8-byte read at s is always in bounds.
-        let mut e = s;
-        loop {
-            if e + 8 > d.len() {
-                while d[e] != b' ' {
-                    e += 1;
-                }
-                break;
-            }
-            let w = word(d, e) ^ 0x2020_2020_2020_2020;
-            let z = w.wrapping_sub(0x0101_0101_0101_0101) & !w & 0x8080_8080_8080_8080;
-            if z != 0 {
-                e += z.trailing_zeros() as usize / 8;
-                break;
-            }
-            e += 8;
-        }
+        // At least " 100 0\n" follows the endpoint's first byte, so 8-byte reads at s are in bounds.
+        let e = find(d, s, b' ');
         let len = e - s;
         let (head, tail) = if len >= 8 { (word(d, s), word(d, e - 8)) } else { (word(d, s) & ((1 << (8 * len)) - 1), 0) };
         let h = (head ^ tail.rotate_left(29) ^ len as u64).wrapping_mul(0x517c_c1b7_2722_0a95);
         let id = c.id(&d[s..e], h);
-        let t = &mut c.tally[id as usize * HOURS + hour as usize];
+        let t = &mut c.tally[id * HOURS + hour(d, p)];
         t[0] += 1;
         t[1] += (d[e + 1] == b'5') as u32;
-        let mut q = e + 5;
-        let mut lat = 0;
-        while d[q] != b'\n' {
-            lat = lat * 10 + digit(q);
-            q += 1;
-        }
-        c.recs.push(id << 40 | hour << 32 | lat);
-        p = q + 1;
+        c.ids.push(id as u16);
+        p = find(d, e + 6, b'\n') + 1;
     }
+    assert!(c.names.len() <= 1 << 16);
     c
 }
 
@@ -191,10 +188,21 @@ fn main() {
     thread::scope(|sc| {
         for c in chunks.iter_mut() {
             sc.spawn(move || {
-                for &r in &c.recs {
-                    let slot = &mut c.tally[(r >> 40) as usize * HOURS + (r >> 32 & 0xff) as usize][0];
-                    unsafe { *out.at(*slot as usize) = r as u32 };
+                // Pass 2: reread each line's hour and latency (read backwards from its end).
+                let d = c.d;
+                let mut p = 0;
+                for &id in &c.ids {
+                    let q = find(d, p + 39, b'\n');
+                    let (mut lat, mut m, mut j) = (0u32, 1u32, q - 1);
+                    while d[j] != b' ' {
+                        lat += (d[j] - b'0') as u32 * m;
+                        m = m.wrapping_mul(10);
+                        j -= 1;
+                    }
+                    let slot = &mut c.tally[id as usize * HOURS + hour(d, p)][0];
+                    unsafe { *out.at(*slot as usize) = lat };
                     *slot += 1;
+                    p = q + 1;
                 }
             });
         }
