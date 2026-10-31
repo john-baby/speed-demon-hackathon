@@ -1,8 +1,12 @@
 // Speed Demon 2026, Track A (Ingest). See README.md for the approach.
 use std::io::Write;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
+use std::arch::x86_64::*;
 
 const HOURS: usize = 72; // 2026-10-30T18:00Z .. 2026-11-02T17:59Z, fixed by the spec
+const B: usize = 8; // latencies per block: few to waste in a group's last block
+const CAP: usize = 4096; // endpoint ids per chunk; the spec's catalogue has 1,842
 
 // Map the input read-only; the host has it in the page cache, so it is not charged to us.
 #[cfg(unix)]
@@ -30,32 +34,22 @@ fn word(d: &[u8], i: usize) -> u64 {
     u64::from_le_bytes(d[i..i + 8].try_into().unwrap())
 }
 
-// Index of the first `b` at or after `i`, 8 bytes at a time.
-fn find(d: &[u8], mut i: usize, b: u8) -> usize {
-    while i + 8 <= d.len() {
-        let w = word(d, i) ^ (b as u64 * 0x0101_0101_0101_0101);
-        let z = w.wrapping_sub(0x0101_0101_0101_0101) & !w & 0x8080_8080_8080_8080;
-        if z != 0 {
-            return i + z.trailing_zeros() as usize / 8;
-        }
-        i += 8;
-    }
-    i + d[i..].iter().position(|&c| c == b).unwrap()
+// Bit k is set where f marks byte k of the 64 (SSE2, so any x86-64 has it); f gets each
+// 16-byte quarter and its number.
+fn bits(b: &[u8; 64], f: impl Fn(__m128i, usize) -> __m128i) -> u64 {
+    (0..4).fold(0, |m, k| {
+        let v = unsafe { _mm_loadu_si128(b.as_ptr().add(16 * k) as *const __m128i) };
+        m | (unsafe { _mm_movemask_epi8(f(v, k)) } as u16 as u64) << (16 * k)
+    })
 }
 
-// The latency that ends just before the newline at q. Digits have bit 4 set and a space
-// does not, so the last space in the 8 bytes before q marks where the number starts.
-fn latency(d: &[u8], q: usize) -> u32 {
-    let w = word(d, q - 8);
-    let other = !w & 0x1010_1010_1010_1010;
-    if other == 0 {
-        // 8 to 10 digits: rare, so go byte by byte.
-        let j = (q - 11..q - 8).rev().find(|&i| d[i] == b' ').unwrap() + 1;
-        return d[j..q].iter().fold(0, |lat, &b| lat * 10 + (b - b'0') as u32);
+// The latency in d[a..q], q being its newline. Up to 8 digits are read as one word whose
+// leading bytes are cleared (they then read as zeros) and combined by three multiplies.
+fn latency(d: &[u8], a: usize, q: usize) -> u32 {
+    if q - a > 8 {
+        return d[a..q].iter().fold(0, |lat, &b| lat * 10 + (b - b'0') as u32);
     }
-    // Keep the digit bytes above the last non-digit (byte k has its flag at bit 8k + 4);
-    // the zeroed bytes below read as leading zeros.
-    let mut v = w & (u64::MAX << (67 - other.leading_zeros()));
+    let mut v = word(d, q - 8) & (u64::MAX << (8 * (8 - (q - a))));
     v = (v & 0x0f0f_0f0f_0f0f_0f0f).wrapping_mul(2561) >> 8;
     v = (v & 0x00ff_00ff_00ff_00ff).wrapping_mul(6_553_601) >> 16;
     ((v & 0x0000_ffff_0000_ffff).wrapping_mul(42_949_672_960_001) >> 32) as u32
@@ -67,26 +61,51 @@ fn hour(d: &[u8], p: usize) -> usize {
     (if day >= 30 { day - 30 } else { day + 1 }) * 24 + digit(p + 11) * 10 + digit(p + 12) - 18
 }
 
-// One thread's view of its chunk, with its own endpoint ids.
-struct Chunk<'a> {
-    d: &'a [u8],
-    ids: Vec<u16>,           // endpoint id of every line
-    tally: Vec<[u32; 2]>,    // [count, 5xx count] at id * HOURS + hour
-    names: Vec<&'a [u8]>,
-    slots: Vec<Slot>, // open addressing; id 0 = empty
+// A group's line count, 5xx count and newest block of latencies.
+#[derive(Clone, Copy, Default)]
+struct Group {
+    n: u32,
+    errors: u32,
+    block: u32,
 }
 
-// An endpoint's first and last 8 bytes and its length; they are the whole name up to 16 bytes.
+// Endpoint names and their ids, in order of first appearance.
+struct Names {
+    names: Vec<Vec<u8>>, // copied, so comparing them later stays in cache
+    pre: Vec<[u8; 64]>,  // the first 64 bytes of each, zero-padded
+    slots: Vec<Slot>,    // open addressing; id 0 = empty
+}
+
+// One thread's view of its chunk, with its own endpoint ids.
+struct Chunk {
+    t: Names,
+    groups: Vec<Group>,  // [hour][endpoint id]; a chunk spans few hours, so few pages are touched
+    lats: Vec<[u32; B]>, // each group's latencies, in a chain of blocks
+    prev: Vec<u32>,      // the block before each block in its group's chain
+}
+
+// Small, so the table stays in L1/L2; the name itself is checked against `pre`.
 #[derive(Clone, Copy, Default)]
 struct Slot {
-    head: u64,
-    tail: u64,
     len: u32,
     id: u32, // id + 1
 }
 
-impl<'a> Chunk<'a> {
-    fn id(&mut self, ep: &'a [u8], head: u64, tail: u64) -> usize {
+impl Names {
+    fn new() -> Names {
+        Names { names: Vec::new(), pre: Vec::new(), slots: vec![Slot::default(); 2 * CAP] }
+    }
+
+    // The id of an endpoint already in memory, padded as `parse` reads it.
+    fn id_of(&mut self, ep: &[u8]) -> usize {
+        let mut head = [0; 8];
+        head[..ep.len().min(8)].copy_from_slice(&ep[..ep.len().min(8)]);
+        let tail = if ep.len() >= 8 { word(ep, ep.len() - 8) } else { 0 };
+        self.id(ep, None, u64::from_le_bytes(head), tail)
+    }
+
+    // win is the 64 bytes from the start of ep, when the input has that many.
+    fn id(&mut self, ep: &[u8], win: Option<&[u8; 64]>, head: u64, tail: u64) -> usize {
         let len = ep.len();
         let h = (head ^ tail.rotate_left(29) ^ len as u64).wrapping_mul(0x517c_c1b7_2722_0a95);
         let mask = self.slots.len() - 1;
@@ -94,52 +113,110 @@ impl<'a> Chunk<'a> {
         loop {
             let s = self.slots[i];
             if s.id == 0 {
-                self.names.push(ep);
-                self.tally.resize(self.names.len() * HOURS, [0; 2]);
-                self.slots[i] = Slot { head, tail, len: len as u32, id: self.names.len() as u32 };
+                self.names.push(ep.to_vec());
+                let mut pre = [0; 64];
+                pre[..len.min(64)].copy_from_slice(&ep[..len.min(64)]);
+                self.pre.push(pre);
+                self.slots[i] = Slot { len: len as u32, id: self.names.len() as u32 };
                 assert!(self.names.len() < self.slots.len() / 2);
                 return self.names.len() - 1;
             }
-            if s.head == head && s.tail == tail && s.len as usize == len
-                && (len <= 16 || ep[8..len - 8] == self.names[s.id as usize - 1][8..len - 8])
-            {
-                return s.id as usize - 1;
+            let id = s.id as usize - 1;
+            if s.len as usize == len && match win {
+                // One fixed-size compare: a loop or a memcmp call here mispredicts on the length.
+                Some(w) if len <= 64 => {
+                    let p = self.pre[id].as_ptr() as *const __m128i;
+                    !bits(w, |v, k| unsafe { _mm_cmpeq_epi8(v, _mm_loadu_si128(p.add(k))) }) & u64::MAX >> (64 - len) == 0
+                }
+                _ => ep == self.names[id],
+            } {
+                return id;
             }
             i = (i + 1) & mask;
         }
     }
 }
 
-// Pass 1: intern each line's endpoint and count lines and 5xx per (endpoint, hour).
-fn parse(d: &[u8]) -> Chunk<'_> {
-    let mut c = Chunk { d, ids: Vec::with_capacity(d.len() / 60), tally: Vec::new(), names: Vec::new(), slots: vec![Slot::default(); 1 << 13] };
-    let mut p = 0;
-    while p < d.len() {
-        // The method is 3 to 7 letters from p + 28, so its end is in the word at p + 31.
-        let s = find(d, p + 31, b' ') + 1;
-        // At least " 100 0\n" follows the endpoint's first byte, so 8-byte reads at s are in bounds.
-        let e = find(d, s, b' ');
-        let len = e - s;
-        let (head, tail) = if len >= 8 { (word(d, s), word(d, e - 8)) } else { (word(d, s) & ((1 << (8 * len)) - 1), 0) };
-        let id = c.id(&d[s..e], head, tail);
-        let t = &mut c.tally[id * HOURS + hour(d, p)];
-        t[0] += 1;
-        t[1] += (d[e + 1] == b'5') as u32;
-        c.ids.push(id as u16);
-        p = find(d, e + 6, b'\n') + 1;
+impl Chunk {
+    // Appends the latencies of group g to v: the newest block holds the last (n - 1) % B + 1,
+    // every older one is full. Whole blocks are copied, as fixed-size moves.
+    fn gather(&self, g: Group, v: &mut Vec<u32>) {
+        let (n, mut b) = (g.n as usize, g.block as usize);
+        v.extend_from_slice(&self.lats[b]);
+        v.truncate(v.len() - (B - 1 - (n - 1) % B));
+        for _ in 0..(n - 1) / B {
+            b = self.prev[b] as usize;
+            v.extend_from_slice(&self.lats[b]);
+        }
     }
-    assert!(c.names.len() <= 1 << 16);
+}
+
+// The only pass over the input: intern each line's endpoint and append its latency to its group.
+fn parse(d: &[u8]) -> Chunk {
+    let blocks = d.len() / 256; // about twice what typical lines need; untouched capacity costs nothing
+    let mut c = Chunk { t: Names::new(), groups: vec![Group::default(); HOURS * CAP],
+        lats: Vec::with_capacity(blocks), prev: Vec::with_capacity(blocks) };
+    // Every line has exactly four spaces and a newline, so the separators, in order, come in
+    // fives and no field is ever searched for. They are collected 64 bytes at a time.
+    let (mut sep, mut n) = ([0usize; 192], 0);
+    for at in (0..d.len()).step_by(64) {
+        let mut b = [0; 64];
+        let w = if at + 64 <= d.len() { d[at..at + 64].try_into().unwrap() } else {
+            b[..d.len() - at].copy_from_slice(&d[at..]);
+            &b
+        };
+        let (sp, nl) = unsafe { (_mm_set1_epi8(b' ' as i8), _mm_set1_epi8(b'\n' as i8)) };
+        let mut m = bits(w, |v, _| unsafe { _mm_or_si128(_mm_cmpeq_epi8(v, sp), _mm_cmpeq_epi8(v, nl)) });
+        // Write eight positions whatever the count (a block rarely has more), so the loop
+        // does not mispredict on how many there are.
+        let end = n + m.count_ones() as usize;
+        while n < end {
+            for k in 0..8 {
+                sep[n + k] = at + m.trailing_zeros() as usize;
+                m &= m.wrapping_sub(1);
+            }
+            n = (n + 8).min(end);
+        }
+        if n < 128 && at + 64 < d.len() {
+            continue;
+        }
+        let mut i = 0;
+        while i + 5 <= n {
+            let [p, s, e, st, q] = [sep[i] - 27, sep[i + 1] + 1, sep[i + 2], sep[i + 3], sep[i + 4]];
+            let len = e - s;
+            // The status and latency follow the endpoint, so 8-byte reads at s are in bounds.
+            let (head, tail) = if len >= 8 { (word(d, s), word(d, e - 8)) } else { (word(d, s) & ((1 << (8 * len)) - 1), 0) };
+            let id = c.t.id(&d[s..e], d.get(s..s + 64).map(|w| w.try_into().unwrap()), head, tail);
+            let g = &mut c.groups[hour(d, p) * CAP + id];
+            let k = g.n as usize % B;
+            if k == 0 {
+                c.prev.push(g.block);
+                g.block = c.lats.len() as u32;
+                c.lats.push([0; B]);
+            }
+            c.lats[g.block as usize][k] = latency(d, st + 1, q);
+            g.n += 1;
+            g.errors += (d[e + 1] == b'5') as u32;
+            i += 5;
+        }
+        sep.copy_within(i..n, 0);
+        n -= i;
+    }
     c
 }
 
-#[derive(Clone, Copy)]
-struct Shared(*mut u32);
-unsafe impl Send for Shared {}
-unsafe impl Sync for Shared {}
-impl Shared {
-    fn at(self, i: usize) -> *mut u32 {
-        unsafe { self.0.add(i) }
+// Appends x in decimal; much cheaper than `write!`.
+fn num(o: &mut Vec<u8>, mut x: usize) {
+    let (mut b, mut i) = ([0; 20], 20);
+    loop {
+        i -= 1;
+        b[i] = b'0' + (x % 10) as u8;
+        x /= 10;
+        if x == 0 {
+            break;
+        }
     }
+    o.extend_from_slice(&b[i..]);
 }
 
 fn hour_label(h: usize) -> String {
@@ -159,7 +236,7 @@ fn main() {
     let d = load(&format!("{data_dir}/requests.log"));
     let nt = thread::available_parallelism().map_or(1, |n| n.get());
 
-    // 1. Split at line starts and parse and count every chunk in parallel.
+    // 1. Split at line starts and parse every chunk in parallel.
     let mut bounds = vec![0];
     for i in 1..nt {
         let mut x = (d.len() * i / nt).max(bounds[i - 1]);
@@ -169,7 +246,7 @@ fn main() {
         bounds.push(x);
     }
     bounds.push(d.len());
-    let mut chunks: Vec<Chunk> = thread::scope(|sc| {
+    let chunks: Vec<Chunk> = thread::scope(|sc| {
         let hs: Vec<_> = (0..nt).map(|i| {
             let part = &d[bounds[i]..bounds[i + 1]];
             sc.spawn(move || parse(part))
@@ -177,100 +254,85 @@ fn main() {
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
 
-    // 2. Rank endpoints in byte order. Latencies are stored by key = rank * HOURS + hour.
-    let mut names: Vec<&[u8]> = chunks.iter().flat_map(|c| c.names.iter().copied()).collect();
-    names.sort_unstable();
-    names.dedup();
-    let ne = names.len();
-    let nk = ne * HOURS;
-    let local: Vec<Vec<usize>> = chunks.iter().map(|c| {
-        let mut l = vec![usize::MAX; ne];
-        for (id, n) in c.names.iter().enumerate() {
-            l[names.binary_search(n).unwrap()] = id;
+    // 2. Rank endpoints in byte order, and map each rank to every chunk's own id.
+    let mut all = Names::new();
+    let global: Vec<Vec<usize>> = chunks.iter().map(|c| c.t.names.iter().map(|n| all.id_of(n)).collect()).collect();
+    let mut order: Vec<usize> = (0..all.names.len()).collect();
+    order.sort_unstable_by_key(|&i| &all.names[i]);
+    let mut rank = vec![0; order.len()];
+    for (r, &i) in order.iter().enumerate() {
+        rank[i] = r;
+    }
+    let local: Vec<Vec<usize>> = global.iter().map(|g| {
+        let mut l = vec![usize::MAX; order.len()];
+        for (id, &i) in g.iter().enumerate() {
+            l[rank[i]] = id;
         }
         l
     }).collect();
+    let names: Vec<&[u8]> = order.iter().map(|&i| &all.names[i][..]).collect();
+    // The longest an hour's output can be: label, name, six 10-digit numbers, spaces, newline.
+    let most: usize = names.iter().map(|n| n.len() + 88).sum();
 
-    // 3. Turn each thread's counts into its write offsets in one key-ordered latency array.
-    let mut start = vec![0usize; nk + 1];
-    let mut errors = vec![0u32; nk];
-    let mut total = 0;
-    for r in 0..ne {
-        for h in 0..HOURS {
-            let k = r * HOURS + h;
-            start[k] = total;
-            for (c, l) in chunks.iter_mut().zip(&local) {
-                if l[r] != usize::MAX {
-                    let t = &mut c.tally[l[r] * HOURS + h];
-                    errors[k] += t[1];
-                    total += t[0] as usize;
-                    t[0] = (total - t[0] as usize) as u32;
-                }
-            }
-        }
-    }
-    start[nk] = total;
-
-    // 4. Scatter latencies; the threads write disjoint slots.
-    let mut lats = vec![0u32; total];
-    let out = Shared(lats.as_mut_ptr());
+    // 3. Each thread takes the next hour, merges every group's blocks from all chunks and
+    // finds the nearest-rank percentiles by selection. Meanwhile this thread writes the
+    // finished hours out in order, so little output is held at once.
+    let next = AtomicUsize::new(0);
+    let mut f = std::fs::File::create(format!("{out_dir}/summary.txt")).unwrap();
     thread::scope(|sc| {
-        for c in chunks.iter_mut() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        for _ in 0..nt {
+            let (chunks, local, names, next, most, tx) = (&chunks, &local, &names, &next, most, tx.clone());
             sc.spawn(move || {
-                // Pass 2: reread each line's hour and latency (read backwards from its end).
-                let d = c.d;
-                let mut p = 0;
-                for &id in &c.ids {
-                    // With the shortest method, the latency starts at p + 37 + the endpoint's length.
-                    let q = find(d, p + 37 + c.names[id as usize].len(), b'\n');
-                    let lat = latency(d, q);
-                    let slot = &mut c.tally[id as usize * HOURS + hour(d, p)][0];
-                    unsafe { *out.at(*slot as usize) = lat };
-                    *slot += 1;
-                    p = q + 1;
-                }
-            });
-        }
-    });
-    drop(chunks);
-
-    // 5. Nearest-rank percentiles by selection, each thread taking a run of hours.
-    let hours: Vec<String> = (0..HOURS).map(hour_label).collect();
-    let parts: Vec<Vec<u8>> = thread::scope(|sc| {
-        let hs: Vec<_> = (0..nt).map(|i| {
-            let (start, errors, names, hours) = (&start, &errors, &names, &hours);
-            sc.spawn(move || {
-                let mut o = Vec::new();
-                for h in HOURS * i / nt..HOURS * (i + 1) / nt {
-                    for r in 0..ne {
-                        let k = r * HOURS + h;
-                        let n = start[k + 1] - start[k];
+                let mut v = Vec::new();
+                loop {
+                    let h = next.fetch_add(1, Ordering::Relaxed);
+                    if h >= HOURS {
+                        return;
+                    }
+                    let label = hour_label(h);
+                    let mut o = Vec::with_capacity(most); // never grown, so never copied
+                    for (r, name) in names.iter().enumerate() {
+                        v.clear();
+                        let mut e = 0;
+                        for (c, l) in chunks.iter().zip(local) {
+                            if l[r] < CAP && c.groups[h * CAP + l[r]].n > 0 {
+                                let g = c.groups[h * CAP + l[r]];
+                                c.gather(g, &mut v);
+                                e += g.errors as usize;
+                            }
+                        }
+                        let n = v.len();
                         if n == 0 {
                             continue;
                         }
-                        // Groups are disjoint, so the threads touch disjoint slices.
-                        let v = unsafe { std::slice::from_raw_parts_mut(out.at(start[k]), n) };
                         let (mut lo, mut ps) = (0, [0u32; 3]);
                         for (j, p) in [50, 95, 99].into_iter().enumerate() {
                             let rank = (p * n + 99) / 100;
                             ps[j] = if rank > lo { *v[lo..].select_nth_unstable(rank - 1 - lo).1 } else { ps[j - 1] };
                             lo = rank;
                         }
-                        let e = errors[k] as usize;
-                        o.extend_from_slice(hours[h].as_bytes());
+                        o.extend_from_slice(label.as_bytes());
                         o.push(b' ');
-                        o.extend_from_slice(names[r]);
-                        writeln!(o, " {n} {} {} {} {e} {}", ps[0], ps[1], ps[2], e * 1_000_000 / n).unwrap();
+                        o.extend_from_slice(name);
+                        for x in [n, ps[0] as usize, ps[1] as usize, ps[2] as usize, e, e * 1_000_000 / n] {
+                            o.push(b' ');
+                            num(&mut o, x);
+                        }
+                        o.push(b'\n');
                     }
+                    tx.send((h, o)).unwrap();
                 }
-                o
-            })
-        }).collect();
-        hs.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+        }
+        drop(tx);
+        let (mut done, mut w) = (vec![None; HOURS], 0);
+        for (h, o) in rx {
+            done[h] = Some(o);
+            while let Some(o) = done.get_mut(w).and_then(Option::take) {
+                f.write_all(&o).unwrap();
+                w += 1;
+            }
+        }
     });
-
-    let mut f = std::fs::File::create(format!("{out_dir}/summary.txt")).unwrap();
-    for p in &parts {
-        f.write_all(p).unwrap();
-    }
 }
