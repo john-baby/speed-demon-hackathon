@@ -145,14 +145,13 @@ struct Agg {
     note_bytes: i64,
 }
 
-// Distinct names across all threads: a lock-free open-addressing table of one-cache-line slots.
-// A slot holds the name's file offset and length (claimed by compare-and-swap), its first 24 bytes,
-// and its bitmask of the groups it occurs in, so a lookup touches one line, not three.
-#[repr(C, align(64))]
+// Distinct names across all threads: a lock-free open-addressing table of half-cache-line slots,
+// each holding the name's file offset and length (claimed by compare-and-swap) and its first 24 bytes.
+// Slots are written once, so after the first few thousand records every thread only reads them.
+#[repr(C, align(32))]
 struct Slot {
     entry: AtomicU64, // offset << 32 | len + 1; 0 = empty, BUSY = being filled
     key: [AtomicU64; 3],
-    mask: [AtomicU64; 4],
 }
 
 const NAME_BITS: u32 = 17; // the generator draws names from a pool of 100,000
@@ -190,7 +189,8 @@ impl Names {
         Lookup { s, len, key, i }
     }
 
-    fn add(&self, d: &[u8], l: &Lookup, g: usize) {
+    // The name's slot, inserting it if new.
+    fn slot(&self, d: &[u8], l: &Lookup) -> usize {
         let Lookup { s, len, key, mut i } = *l;
         let entry = (s as u64) << 32 | (len as u64 + 1);
         loop {
@@ -216,81 +216,99 @@ impl Names {
                 && slot.key.iter().zip(&key).all(|(k, &w)| k.load(Relaxed) == w)
                 && (len <= 24 || d[o + 24..o + len] == d[s + 24..s + len])
             {
-                let m = &slot.mask[g / 64];
-                if m.load(Relaxed) >> (g % 64) & 1 == 0 {
-                    m.fetch_or(1 << (g % 64), Relaxed);
-                }
-                return;
+                return i;
             }
             i = (i + 1) & ((1 << NAME_BITS) - 1);
         }
     }
 }
 
-// Parse the records in d[start..end] (start is a record start, outside quotes) and aggregate them
-// by group: rank[code_of[region_id]] is the region's group, and a missing region is group `unmatched`.
-fn parse(d: &[u8], start: usize, end: usize, code_of: &[u16], rank: &[u16], unmatched: usize, names: &Names) -> Vec<Agg> {
-    let empty = Agg { count: 0, id_sum: 0, amount_sum: 0, min: i64::MAX, max: i64::MIN, name_bytes: 0, note_bytes: 0 };
-    let mut aggs = vec![empty; unmatched + 1];
-    let mut pending = None;
-    let finish = |aggs: &mut [Agg], (l, region, id, cents, name_bytes, bytes): (Lookup, usize, i64, i64, usize, i64)| {
-        let g = code_of.get(region).filter(|&&c| c != NONE).map_or(unmatched, |&c| rank[c as usize] as usize);
-        let a = &mut aggs[g];
-        a.count += 1;
-        a.id_sum += id;
-        a.amount_sum += cents;
-        a.min = a.min.min(cents);
-        a.max = a.max.max(cents);
-        a.name_bytes += name_bytes as i64;
-        a.note_bytes += bytes - name_bytes as i64;
-        let _ = (&l, g);
-    };
-    // A field of n bytes holding q quote bytes is a value of n bytes when q is 0, and of
-    // n - 1 - q/2 bytes when quoted: two delimiting quotes and one byte saved per "" escape.
-    let value_len = |n: usize, q: usize| if q == 0 { n } else { n - 1 - q / 2 };
-    let mut f = Fields::new(d, start);
-    let mut p = start;
-    while p < end {
-        p += if d[p..].starts_with(BOM) { 3 } else { 0 };
-        let ((c1, q1), (c2, q2), (c3, q3), (c4, _), (lf, _)) = (f.next(), f.next(), f.next(), f.next(), f.next());
-        let id = digits(&d[p..c1]);
-        let name = if q2 > q1 { &d[c1 + 2..c2 - 1] } else { &d[c1 + 1..c2] };
-        let name_len = value_len(c2 - c1 - 1, q2 - q1);
-        let note_len = value_len(c3 - c2 - 1, q3 - q2);
-        let region = digits(&d[c3 + 1..c4]) as usize;
-        let amount = &d[c4 + 1..lf - (d[lf - 1] == b'\r') as usize];
-        let negative = amount[0] == b'-';
-        let cents = (digits(&amount[negative as usize..amount.len() - 3]) * 100 + digits(&amount[amount.len() - 2..])) * if negative { -1 } else { 1 };
-        p = lf + 1;
-
-        // Finish the previous record while this one's region and name lines are on their way in.
-        if let Some(r) = code_of.get(region) {
-            prefetch(r);
-        }
-        let l = names.lookup(d, name.as_ptr() as usize - d.as_ptr() as usize, name.len());
-        if let Some(prev) = pending.replace((l, region, id, cents, name_len, (name_len + note_len) as i64)) {
-            finish(&mut aggs, prev);
-        }
-    }
-    if let Some(prev) = pending {
-        finish(&mut aggs, prev);
-    }
-    aggs
+// A thread's share of records.csv, parsed a round at a time. Each record's (name slot, group) pair
+// goes to the bucket of the thread that owns that slot's group mask, so masks are only ever written
+// by their owner and no cache line bounces between cores.
+struct Chunk<'a> {
+    f: Fields<'a>,
+    p: usize,
+    end: usize,
+    aggs: Vec<Agg>,
 }
+
+struct Ctx<'a> {
+    d: &'a [u8],
+    code_of: &'a [u16],
+    rank: &'a [u16],
+    unmatched: usize,
+    names: &'a Names,
+}
+
+impl<'a> Chunk<'a> {
+    // Parse the records starting before `until` (record starts are outside quotes) and aggregate them
+    // by group: rank[code_of[region_id]] is the region's group, and a missing region is `unmatched`.
+    fn run(&mut self, c: &Ctx, until: usize, out: &mut [Vec<u32>]) {
+        let (d, nt) = (c.d, out.len());
+        let mut pending = None;
+        let mut finish = |aggs: &mut [Agg], (l, region, id, cents, name_bytes, bytes): (Lookup, usize, i64, i64, usize, i64)| {
+            let g = c.code_of.get(region).filter(|&&k| k != NONE).map_or(c.unmatched, |&k| c.rank[k as usize] as usize);
+            let a = &mut aggs[g];
+            a.count += 1;
+            a.id_sum += id;
+            a.amount_sum += cents;
+            a.min = a.min.min(cents);
+            a.max = a.max.max(cents);
+            a.name_bytes += name_bytes as i64;
+            a.note_bytes += bytes - name_bytes as i64;
+            let i = c.names.slot(d, &l);
+            out[i * nt >> NAME_BITS].push((i as u32) << 8 | g as u32);
+        };
+        // A field of n bytes holding q quote bytes is a value of n bytes when q is 0, and of
+        // n - 1 - q/2 bytes when quoted: two delimiting quotes and one byte saved per "" escape.
+        let value_len = |n: usize, q: usize| if q == 0 { n } else { n - 1 - q / 2 };
+        let (f, mut p) = (&mut self.f, self.p);
+        let until = until.min(self.end);
+        while p < until {
+            p += if d[p..].starts_with(BOM) { 3 } else { 0 };
+            let ((c1, q1), (c2, q2), (c3, q3), (c4, _), (lf, _)) = (f.next(), f.next(), f.next(), f.next(), f.next());
+            let id = digits(&d[p..c1]);
+            let name = if q2 > q1 { &d[c1 + 2..c2 - 1] } else { &d[c1 + 1..c2] };
+            let name_len = value_len(c2 - c1 - 1, q2 - q1);
+            let note_len = value_len(c3 - c2 - 1, q3 - q2);
+            let region = digits(&d[c3 + 1..c4]) as usize;
+            let amount = &d[c4 + 1..lf - (d[lf - 1] == b'\r') as usize];
+            let negative = amount[0] == b'-';
+            let cents = (digits(&amount[negative as usize..amount.len() - 3]) * 100 + digits(&amount[amount.len() - 2..])) * if negative { -1 } else { 1 };
+            p = lf + 1;
+
+            // Finish the previous record while this one's region and name lines are on their way in.
+            if let Some(r) = c.code_of.get(region) {
+                prefetch(r);
+            }
+            let l = c.names.lookup(d, name.as_ptr() as usize - d.as_ptr() as usize, name.len());
+            if let Some(prev) = pending.replace((l, region, id, cents, name_len, (name_len + note_len) as i64)) {
+                finish(&mut self.aggs, prev);
+            }
+        }
+        if let Some(prev) = pending {
+            finish(&mut self.aggs, prev);
+        }
+        self.p = p;
+    }
+}
+
+// A value threads hand each other between barriers: each round, thread t fills its own buckets,
+// then (after a barrier) every owner reads the buckets addressed to it.
+struct Cell<T>(std::cell::UnsafeCell<T>);
+unsafe impl<T> Sync for Cell<T> {}
 
 fn money(c: i64) -> String {
     format!("{}{}.{:02}", if c < 0 { "-" } else { "" }, c.abs() / 100, c.abs() % 100)
 }
 
 fn main() {
-    let t0 = std::time::Instant::now();
-    let mut marks = String::new();
     let args: Vec<String> = std::env::args().collect();
     let data_dir = args.get(1).map_or("/data", |s| s.as_str());
     let out_dir = args.get(2).map_or("/out", |s| s.as_str());
     let nt = thread::available_parallelism().map_or(1, |n| n.get());
 
-    marks += &format!("_0x{}", t0.elapsed().as_micros());
     // 1. Regions, in parallel: code_of[region_id] is the region's country code as a number below
     //    26^3, and rank[code] its group (the code's place in sorted order); the threads fill
     //    disjoint ids. A region id not listed maps to `unmatched`.
@@ -326,7 +344,6 @@ fn main() {
     }
     let unmatched = codes.len();
 
-    marks += &format!("_1x{}", t0.elapsed().as_micros());
     // 2. Split records.csv at record starts. Notes are lowercase words and quotes and names never
     //    hold an LF, so an LF followed by a digit or a BOM always ends a record.
     let d = load(&format!("{data_dir}/records.csv"));
@@ -344,11 +361,11 @@ fn main() {
     }
     starts.push(d.len());
 
-    marks += &format!("_2x{}", t0.elapsed().as_micros());
-    // 3. Parse and aggregate every chunk in parallel, all threads sharing one name table.
+    // 3. Parse and aggregate every chunk in parallel, all threads sharing one name table, in rounds
+    //    of about ROUND bytes per thread so the buckets stay in cache.
     let groups = unmatched + 1;
     assert!(groups <= 256, "group masks hold 256 groups");
-    // All-zero is an empty slot, so take zeroed pages from the allocator rather than writing 8 MB
+    // All-zero is an empty slot, so take zeroed pages from the allocator rather than writing 4 MB
     // on one thread; the parsing threads fault them in as they touch them.
     let names = Names {
         slots: unsafe {
@@ -356,35 +373,53 @@ fn main() {
             Vec::from_raw_parts(std::alloc::alloc_zeroed(std::alloc::Layout::array::<Slot>(n).unwrap()) as *mut Slot, n, n)
         },
     };
-    let parts: Vec<Vec<Agg>> = thread::scope(|sc| {
-        let hs: Vec<_> = (0..nt).map(|i| {
-            let (s, e, code_of, rank, names) = (starts[i], starts[i + 1], &code_of, &rank, &names);
-            sc.spawn(move || parse(d, s, e, code_of, rank, unmatched, names))
+    const ROUND: usize = 1 << 20;
+    let rounds = (0..nt).map(|i| starts[i + 1] - starts[i]).max().unwrap_or(0).div_ceil(ROUND).max(1);
+    let buckets: Vec<Cell<Vec<Vec<u32>>>> = (0..nt).map(|_| Cell(std::cell::UnsafeCell::new(vec![Vec::new(); nt]))).collect();
+    let barrier = std::sync::Barrier::new(nt);
+    let ctx = Ctx { d, code_of: &code_of, rank: &rank, unmatched, names: &names };
+    let parts: Vec<(Vec<Agg>, Vec<i64>)> = thread::scope(|sc| {
+        let hs: Vec<_> = (0..nt).map(|t| {
+            let (s, e, ctx, buckets, barrier) = (starts[t], starts[t + 1], &ctx, &buckets, &barrier);
+            sc.spawn(move || {
+                let empty = Agg { count: 0, id_sum: 0, amount_sum: 0, min: i64::MAX, max: i64::MIN, name_bytes: 0, note_bytes: 0 };
+                let mut chunk = Chunk { f: Fields::new(d, s), p: s, end: e, aggs: vec![empty; groups] };
+                // This thread's group masks: those of slots lo..hi.
+                let (lo, hi) = (((t << NAME_BITS) + nt - 1) / nt, (((t + 1) << NAME_BITS) + nt - 1) / nt);
+                let mut masks = vec![[0u64; 4]; hi - lo];
+                for r in 0..rounds {
+                    let out = unsafe { &mut *buckets[t].0.get() };
+                    out.iter_mut().for_each(Vec::clear);
+                    chunk.run(ctx, s + (e - s) * (r + 1) / rounds, out);
+                    barrier.wait();
+                    for b in buckets {
+                        for &x in &unsafe { &*b.0.get() }[t] {
+                            let (i, g) = ((x >> 8) as usize - lo, (x & 255) as usize);
+                            masks[i][g / 64] |= 1 << (g % 64);
+                        }
+                    }
+                    barrier.wait();
+                }
+                // 4. Each group's distinct names are the masks with its bit set.
+                let mut c = vec![0i64; groups];
+                for m in &masks {
+                    for (w, &word) in m.iter().enumerate() {
+                        let mut bits = word;
+                        while bits != 0 {
+                            c[w * 64 + bits.trailing_zeros() as usize] += 1;
+                            bits &= bits - 1;
+                        }
+                    }
+                }
+                (chunk.aggs, c)
+            })
         }).collect();
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
-
-    marks += &format!("_3x{}", t0.elapsed().as_micros());
-    // 4. Each group's distinct names are the masks with its bit set, counted over slot ranges in parallel.
-    let counts: Vec<Vec<i64>> = thread::scope(|sc| {
-        let hs: Vec<_> = names.slots.chunks(names.slots.len().div_ceil(nt)).map(|part| sc.spawn(move || {
-            let mut c = vec![0i64; groups];
-            for slot in part {
-                for (w, word) in slot.mask.iter().enumerate() {
-                    let mut bits = word.load(Relaxed);
-                    while bits != 0 {
-                        c[w * 64 + bits.trailing_zeros() as usize] += 1;
-                        bits &= bits - 1;
-                    }
-                }
-            }
-            c
-        })).collect();
-        hs.into_iter().map(|h| h.join().unwrap()).collect()
-    });
+    let counts: Vec<&Vec<i64>> = parts.iter().map(|p| &p.1).collect();
+    let parts: Vec<&Vec<Agg>> = parts.iter().map(|p| &p.0).collect();
     let distinct: Vec<i64> = (0..groups).map(|g| counts.iter().map(|c| c[g]).sum()).collect();
 
-    marks += &format!("_4x{}", t0.elapsed().as_micros());
     let mut o = Vec::new();
     for g in 0..groups {
         let mut a = parts[0][g];
@@ -405,6 +440,4 @@ fn main() {
         writeln!(o, "{key} {} {} {} {} {} {} {} {}", a.count, a.id_sum, money(a.amount_sum), money(a.min), money(a.max), distinct[g], a.name_bytes, a.note_bytes).unwrap();
     }
     std::fs::write(format!("{out_dir}/aggregates.txt"), o).unwrap();
-    marks += &format!("_ex{}", t0.elapsed().as_micros());
-    std::fs::write(format!("{out_dir}/PROFCNONAMES{marks}"), b"").unwrap();
 }

@@ -130,64 +130,52 @@ fn transpose(g: &Graph, nt: usize) -> Graph {
     Graph { off, adj }
 }
 
-// Distances of one search, in a small open-addressing table so a search costs what it touches.
+// Distances of one search, as a paged array: node ids are renumbered for locality, so a search
+// touches few blocks of 1,024 consecutive ids, and only those get a page. Lookups cost what an array
+// costs, and memory what the search touches.
+const PAGE: usize = 1024;
+
 struct Map {
-    keys: Vec<u32>,
-    vals: Vec<u64>,
-    used: Vec<usize>,
-    shift: u32,
+    dir: Vec<u32>, // page index + 1 for each block of ids, 0 = none
+    pages: Vec<[u64; PAGE]>,
+    used: usize,
+    blocks: Vec<u32>,
 }
 
-const EMPTY: u32 = u32::MAX;
-
 impl Map {
-    fn new(bits: u32) -> Map {
-        Map { keys: vec![EMPTY; 1 << bits], vals: vec![0; 1 << bits], used: Vec::new(), shift: 64 - bits }
-    }
-
-    fn slot(&self, k: u32) -> usize {
-        let mask = self.keys.len() - 1;
-        let mut i = ((k as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> self.shift) as usize;
-        while self.keys[i] != k && self.keys[i] != EMPTY {
-            i = (i + 1) & mask;
-        }
-        i
+    fn new(n: usize) -> Map {
+        Map { dir: vec![0; n.div_ceil(PAGE)], pages: Vec::new(), used: 0, blocks: Vec::new() }
     }
 
     fn get(&self, k: u32) -> u64 {
-        let i = self.slot(k);
-        if self.keys[i] == k { self.vals[i] } else { u64::MAX }
+        match self.dir[k as usize / PAGE] {
+            0 => u64::MAX,
+            p => self.pages[p as usize - 1][k as usize % PAGE],
+        }
     }
 
     fn set(&mut self, k: u32, v: u64) {
-        let i = self.slot(k);
-        if self.keys[i] == EMPTY {
-            if self.used.len() * 2 >= self.keys.len() {
-                self.grow();
-                return self.set(k, v);
+        let b = k as usize / PAGE;
+        if self.dir[b] == 0 {
+            if self.used == self.pages.len() {
+                self.pages.push([u64::MAX; PAGE]);
+            } else {
+                self.pages[self.used] = [u64::MAX; PAGE];
             }
-            self.keys[i] = k;
-            self.used.push(i);
+            self.used += 1;
+            self.dir[b] = self.used as u32;
+            self.blocks.push(b as u32);
         }
-        self.vals[i] = v;
+        self.pages[self.dir[b] as usize - 1][k as usize % PAGE] = v;
     }
 
-    fn grow(&mut self) {
-        let old = std::mem::replace(self, Map::new(65 - self.shift));
-        for &i in &old.used {
-            self.set(old.keys[i], old.vals[i]);
-        }
-    }
-
-    // Empty the table; one a long search grew past 2^15 slots goes back to the small size, so
-    // twelve threads do not each keep the largest table they ever needed.
+    // Empty the map; pages a long search needed beyond 64 are given back.
     fn clear(&mut self) {
-        if self.keys.len() > 1 << 15 {
-            *self = Map::new(12);
+        for b in self.blocks.drain(..) {
+            self.dir[b as usize] = 0;
         }
-        for i in self.used.drain(..) {
-            self.keys[i] = EMPTY;
-        }
+        self.used = 0;
+        self.pages.truncate(64);
     }
 }
 
@@ -360,8 +348,8 @@ fn main() {
         let hs: Vec<_> = (0..nt).map(|_| {
             let (fwd, bwd, pairs, next) = (&fwd, &bwd, &pairs, &next);
             sc.spawn(move || {
-                let mut f = Side { g: fwd, dist: Map::new(12), heap: BinaryHeap::new() };
-                let mut b = Side { g: bwd, dist: Map::new(12), heap: BinaryHeap::new() };
+                let mut f = Side { g: fwd, dist: Map::new(n), heap: BinaryHeap::new() };
+                let mut b = Side { g: bwd, dist: Map::new(n), heap: BinaryHeap::new() };
                 let mut done = Vec::new();
                 loop {
                     let i = next.fetch_add(1, Relaxed);
