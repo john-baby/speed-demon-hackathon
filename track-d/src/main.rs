@@ -125,11 +125,11 @@ fn running(c: &[AtomicU32], nt: usize) {
 // Renumber nodes so a search walks nearby memory: every thread grows breadth-first regions from
 // seeds in its own id range, and the threads' visiting orders, one after another, are the new
 // numbering. A thread claims a node by writing its provisional id, thread << bits | its place in
-// that thread's order + 1 (0 is free), with a compare-and-swap, so reading a neighbour's slot gives
-// either nothing (and the reader claims it) or its id. Each thread writes its nodes' edges, renamed
-// provisionally, as it visits them, so the old graph is read once. A last pass turns provisional
-// ids into final ones while copying the edges into the old graph's memory, and counts in-degrees
-// for the transpose. Returns the new graph, its in-degrees and the map from old ids to new.
+// that thread's order + 1 (0 is free), with a compare-and-swap, so reading a neighbour's slot gives either nothing
+// (and the reader claims it) or its id. Each thread writes its nodes' edges, renamed provisionally,
+// as it visits them, so the old graph is read once. A last pass turns provisional ids into final
+// ones while copying the edges into place, and counts in-degrees for the transpose. Returns the new
+// graph, its in-degrees and the map from old ids to new.
 fn renumber(g: Graph, nt: usize) -> (Graph, Vec<AtomicU32>, impl Fn(usize) -> u32) {
     const FREE: u32 = 0;
     let n = g.off.len() - 1;
@@ -189,15 +189,16 @@ fn renumber(g: Graph, nt: usize) -> (Graph, Vec<AtomicU32>, impl Fn(usize) -> u3
         }).collect();
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
+    drop(g);
     let prefix = |len: &dyn Fn(&(Vec<u32>, Vec<[u32; 2]>)) -> usize| -> Vec<u32> {
         parts.iter().scan(0, |acc, p| { let b = *acc; *acc += len(p) as u32; Some(b) }).collect()
     };
     let (base, ebase) = (prefix(&|p| p.0.len()), prefix(&|p| p.1.len()));
+    let m = parts.iter().map(|p| p.1.len()).sum::<usize>();
     let mask = (1 << bits) - 1;
     let new_id = move |r: u32| base[(r >> bits) as usize] + (r & mask) - 1;
-    // The old graph has exactly the new one's shape: reuse its memory instead of freeing 47 MB
-    // on one thread and faulting 47 MB of fresh pages back in.
-    let Graph { mut off, mut adj } = g;
+    let mut off = vec![0u32; n + 1];
+    let mut adj = vec![[0u32; 2]; m];
     let ins = zeroed(n + 1);
     let (fo, fa) = (Shared(off.as_mut_ptr()), Shared(adj.as_mut_ptr()));
     // Each thread also frees its own part, so the 47 MB are given back in parallel.
