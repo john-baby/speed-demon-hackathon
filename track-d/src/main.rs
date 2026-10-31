@@ -95,32 +95,47 @@ struct Graph {
     adj: Vec<[u32; 2]>,
 }
 
-// Turn per-node counts into start offsets, leaving each counter at its node's first write slot.
-fn offsets(count: &[AtomicU32]) -> Vec<u32> {
-    let mut total = 0;
-    let off: Vec<u32> = count.iter().map(|c| {
-        let start = total;
-        total += c.load(Relaxed);
-        c.store(start, Relaxed);
-        start
-    }).collect();
-    off
+// n zeroed counters. calloc hands out untouched zero pages, so the threads that first write them
+// fault them in, in parallel, instead of one thread filling 7 MB up front.
+fn zeroed(n: usize) -> Vec<AtomicU32> {
+    let mut v = std::mem::ManuallyDrop::new(vec![0u32; n]);
+    unsafe { Vec::from_raw_parts(v.as_mut_ptr().cast(), n, v.capacity()) }
+}
+
+// Turn counts into running totals in place, in parallel: each thread sums its slice, then adds the
+// totals of the slices before it to its own.
+fn running(c: &[AtomicU32], nt: usize) {
+    let slice = |i: usize| &c[c.len() * i / nt..c.len() * (i + 1) / nt];
+    let sums: Vec<u32> = thread::scope(|sc| {
+        let hs: Vec<_> = (0..nt).map(|i| sc.spawn(move || slice(i).iter().map(|x| x.load(Relaxed)).sum())).collect();
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    thread::scope(|sc| {
+        for (i, mut total) in sums.iter().scan(0, |acc, &x| { let b = *acc; *acc += x; Some(b) }).enumerate() {
+            sc.spawn(move || {
+                for x in slice(i) {
+                    total += x.load(Relaxed);
+                    x.store(total, Relaxed);
+                }
+            });
+        }
+    });
 }
 
 // Renumber nodes so a search walks nearby memory: every thread grows breadth-first regions from
 // seeds in its own id range, and the threads' visiting orders, one after another, are the new
 // numbering. A thread claims a node by writing its provisional id, thread << bits | its place in
-// that thread's order, with a compare-and-swap, so reading a neighbour's slot gives either nothing
+// that thread's order + 1 (0 is free), with a compare-and-swap, so reading a neighbour's slot gives either nothing
 // (and the reader claims it) or its id. Each thread writes its nodes' edges, renamed provisionally,
 // as it visits them, so the old graph is read once. A last pass turns provisional ids into final
 // ones while copying the edges into place, and counts in-degrees for the transpose. Returns the new
 // graph, its in-degrees and the map from old ids to new.
 fn renumber(g: Graph, nt: usize) -> (Graph, Vec<AtomicU32>, impl Fn(usize) -> u32) {
-    const FREE: u32 = u32::MAX;
+    const FREE: u32 = 0;
     let n = g.off.len() - 1;
     let bits = usize::BITS - n.leading_zeros();
     assert!((nt as u64) << bits < 1 << 32, "provisional ids fit u32");
-    let tmp: Vec<AtomicU32> = (0..n).map(|_| AtomicU32::new(FREE)).collect();
+    let tmp = zeroed(n);
     let parts: Vec<(Vec<u32>, Vec<[u32; 2]>)> = thread::scope(|sc| {
         let hs: Vec<_> = (0..nt).map(|t| {
             let (g, tmp) = (&g, &tmp);
@@ -130,7 +145,7 @@ fn renumber(g: Graph, nt: usize) -> (Graph, Vec<AtomicU32>, impl Fn(usize) -> u3
                 let (mut order, mut ends) = (Vec::with_capacity(room), Vec::with_capacity(room));
                 let mut edges: Vec<[u32; 2]> = Vec::with_capacity(g.adj.len() / nt + g.adj.len() / nt / 4);
                 for root in n * t / nt..n * (t + 1) / nt {
-                    let id = (t << bits | order.len()) as u32;
+                    let id = (t << bits | order.len() + 1) as u32;
                     if tmp[root].load(Relaxed) != FREE || tmp[root].compare_exchange(FREE, id, Relaxed, Relaxed).is_err() {
                         continue;
                     }
@@ -155,7 +170,7 @@ fn renumber(g: Graph, nt: usize) -> (Graph, Vec<AtomicU32>, impl Fn(usize) -> u3
                         for &[v, w] in edges_of(u) {
                             let mut r = tmp[v as usize].load(Relaxed);
                             if r == FREE {
-                                let id = (t << bits | order.len()) as u32;
+                                let id = (t << bits | order.len() + 1) as u32;
                                 r = match tmp[v as usize].compare_exchange(FREE, id, Relaxed, Relaxed) {
                                     Ok(_) => {
                                         order.push(v);
@@ -181,14 +196,15 @@ fn renumber(g: Graph, nt: usize) -> (Graph, Vec<AtomicU32>, impl Fn(usize) -> u3
     let (base, ebase) = (prefix(&|p| p.0.len()), prefix(&|p| p.1.len()));
     let m = parts.iter().map(|p| p.1.len()).sum::<usize>();
     let mask = (1 << bits) - 1;
-    let new_id = move |r: u32| base[(r >> bits) as usize] + (r & mask);
+    let new_id = move |r: u32| base[(r >> bits) as usize] + (r & mask) - 1;
     let mut off = vec![0u32; n + 1];
     let mut adj = vec![[0u32; 2]; m];
-    let ins: Vec<AtomicU32> = (0..=n).map(|_| AtomicU32::new(0)).collect();
+    let ins = zeroed(n + 1);
     let (fo, fa) = (Shared(off.as_mut_ptr()), Shared(adj.as_mut_ptr()));
+    // Each thread also frees its own part, so the 47 MB are given back in parallel.
     thread::scope(|sc| {
-        for (t, (ends, edges)) in parts.iter().enumerate() {
-            let (new_id, ins, b, e) = (&new_id, &ins, new_id((t << bits) as u32) as usize, ebase[t]);
+        for (t, (ends, edges)) in parts.into_iter().enumerate() {
+            let (new_id, ins, b, e) = (&new_id, &ins, new_id((t << bits | 1) as u32) as usize, ebase[t]);
             sc.spawn(move || {
                 for (h, &end) in ends.iter().enumerate() {
                     unsafe { *fo.at(b + h + 1) = e + end };
@@ -206,7 +222,9 @@ fn renumber(g: Graph, nt: usize) -> (Graph, Vec<AtomicU32>, impl Fn(usize) -> u3
 
 // The reverse graph of g, given its in-degrees: place every edge u -> v as v <- u. Once nodes are
 // renumbered for locality, u and v are mostly close, so the counters and the writes stay local.
-fn transpose(g: &Graph, ins: &[AtomicU32], nt: usize) -> Graph {
+// The in-degrees become each node's end, and every edge is placed by counting its head's counter
+// down, which leaves the counters at the starts: they are the offsets.
+fn transpose(g: &Graph, ins: Vec<AtomicU32>, nt: usize) -> Graph {
     let n = g.off.len() - 1;
     let each = |f: &(dyn Fn(usize, u32, u32) + Sync)| thread::scope(|sc| {
         for i in 0..nt {
@@ -219,10 +237,12 @@ fn transpose(g: &Graph, ins: &[AtomicU32], nt: usize) -> Graph {
             });
         }
     });
-    let off = offsets(ins);
+    running(&ins, nt);
     let mut adj = vec![[0u32; 2]; g.adj.len()];
     let out = Shared(adj.as_mut_ptr());
-    each(&|u, v, w| unsafe { *out.at(ins[v as usize].fetch_add(1, Relaxed) as usize) = [u as u32, w] });
+    each(&|u, v, w| unsafe { *out.at(ins[v as usize].fetch_sub(1, Relaxed) as usize - 1) = [u as u32, w] });
+    let mut ins = std::mem::ManuallyDrop::new(ins);
+    let off = unsafe { Vec::from_raw_parts(ins.as_mut_ptr().cast(), ins.len(), ins.capacity()) };
     Graph { off, adj }
 }
 
@@ -518,8 +538,7 @@ fn main() {
 
     // 3. Renumber nodes for locality, then derive the reverse graph.
     let (fwd, ins, rank) = renumber(fwd, nt);
-    let bwd = transpose(&fwd, &ins, nt);
-    drop(ins);
+    let bwd = transpose(&fwd, ins, nt);
 
     // 4. Answer the queries on every core, each thread taking the next unanswered one.
     let q = std::fs::read(format!("{data_dir}/queries.txt")).unwrap();

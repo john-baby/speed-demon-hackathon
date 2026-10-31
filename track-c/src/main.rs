@@ -25,19 +25,6 @@ fn load(path: &str) -> &'static [u8] {
     std::fs::read(path).unwrap().leak()
 }
 
-// Map the page-cache pages of d[s..e] in one call rather than one fault per few pages while parsing.
-#[cfg(unix)]
-fn populate(d: &[u8], s: usize, e: usize) {
-    extern "C" {
-        fn madvise(addr: *const u8, len: usize, advice: i32) -> i32;
-    }
-    let a = s & !4095;
-    unsafe { madvise(d.as_ptr().add(a), e - a, 22) }; // MADV_POPULATE_READ; an old kernel just refuses
-}
-
-#[cfg(not(unix))]
-fn populate(_: &[u8], _: usize, _: usize) {}
-
 const BOM: &[u8] = b"\xef\xbb\xbf";
 const NONE: u16 = u16::MAX;
 
@@ -408,7 +395,6 @@ fn main() {
             let (s, e, ctx, buckets, barrier) = (starts[t], starts[t + 1], &ctx, &buckets, &barrier);
             sc.spawn(move || {
                 let empty = Agg { count: 0, id_sum: 0, amount_sum: 0, min: i64::MAX, max: i64::MIN, name_bytes: 0, note_bytes: 0 };
-                populate(d, s, e);
                 let mut chunk = Chunk { f: Fields::new(d, s), p: s, end: e, aggs: vec![empty; groups] };
                 // This thread's group masks: those of slots lo..hi.
                 let (lo, hi) = (((t << NAME_BITS) + nt - 1) / nt, (((t + 1) << NAME_BITS) + nt - 1) / nt);
@@ -466,4 +452,6 @@ fn main() {
         writeln!(o, "{key} {} {} {} {} {} {} {} {}", a.count, a.id_sum, money(a.amount_sum), money(a.min), money(a.max), distinct[g], a.name_bytes, a.note_bytes).unwrap();
     }
     std::fs::write(format!("{out_dir}/aggregates.txt"), o).unwrap();
+    // Leave without freeing the tables one by one; the kernel reclaims everything at once.
+    std::process::exit(0);
 }
