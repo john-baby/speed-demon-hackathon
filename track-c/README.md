@@ -26,5 +26,5 @@ None.
 
 ## With another 24 hours
 
-- The latest board profile shows each thread parsing for 33-37 ms, plus 2-6 ms at barriers waiting for the slowest thread, and 4.8 ms at exit unmapping the 200 MB input. Reading the input into reused buffers instead of mapping it would remove the unmapping, and smaller, dynamically assigned chunks would even out the threads.
+- The latest board profile shows each thread parsing for 33-37 ms, plus 2-6 ms at barriers waiting for the slowest thread, and 4.8 ms at exit unmapping the 200 MB input. Reading the input with `pread` into reused buffers removed the unmapping but measured no faster, since each thread then copies its share itself (PERF.md step 16). Smaller, dynamically assigned chunks would even out the threads.
 - Getting a record's five delimiters out of the masks is now the largest single cost. A design that needs fewer instructions per delimiter is the next big step. Scanning ahead into a position array, and AVX2, measured no faster.
