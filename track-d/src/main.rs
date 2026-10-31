@@ -276,13 +276,17 @@ impl<V: Dist> Map<V> {
         self.pages[self.dir[b] as usize - 1][k as usize % PAGE] = v;
     }
 
-    // Empty the map; pages a long search needed beyond 64 are given back.
+    // Empty the map. Pages a long search needed beyond 64 are freed, so 24 maps do not each keep
+    // the largest search they ever ran.
     fn clear(&mut self) {
         for b in self.blocks.drain(..) {
             self.dir[b as usize] = 0;
         }
         self.used = 0;
-        self.pages.truncate(64);
+        if self.pages.len() > 64 {
+            self.pages.truncate(64);
+            self.pages.shrink_to_fit();
+        }
     }
 }
 
@@ -414,6 +418,16 @@ fn query<'g, K: Key>(f: &mut Side<'g, K>, b: &mut Side<'g, K>, s: u32, t: u32) -
 }
 
 fn main() {
+    // glibc raises its mmap threshold to the size of each large block freed, up to 32 MB, after
+    // which a freed block stays with the allocator instead of going back to the system. Fix it at
+    // 256 KB (64 pages), so the pages a long search freed really leave.
+    #[cfg(unix)]
+    unsafe {
+        extern "C" {
+            fn mallopt(param: i32, value: i32) -> i32;
+        }
+        mallopt(-3, 1 << 18); // M_MMAP_THRESHOLD
+    }
     let args: Vec<String> = std::env::args().collect();
     let data_dir = args.get(1).map_or("/data", |s| s.as_str());
     let out_dir = args.get(2).map_or("/out", |s| s.as_str());
