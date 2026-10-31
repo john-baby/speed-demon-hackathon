@@ -303,13 +303,7 @@ fn money(c: i64) -> String {
     format!("{}{}.{:02}", if c < 0 { "-" } else { "" }, c.abs() / 100, c.abs() % 100)
 }
 
-static RUN: AtomicU64 = AtomicU64::new(0);
-static RUNMAX: AtomicU64 = AtomicU64::new(0);
-static WAIT: AtomicU64 = AtomicU64::new(0);
-static OWN: AtomicU64 = AtomicU64::new(0);
 fn main() {
-    let t0 = std::time::Instant::now();
-    let mut marks = String::new();
     let args: Vec<String> = std::env::args().collect();
     let data_dir = args.get(1).map_or("/data", |s| s.as_str());
     let out_dir = args.get(2).map_or("/out", |s| s.as_str());
@@ -350,7 +344,6 @@ fn main() {
     }
     let unmatched = codes.len();
 
-    marks += &format!("_0x{}", t0.elapsed().as_micros());
     // 2. Split records.csv at record starts. Notes are lowercase words and quotes and names never
     //    hold an LF, so an LF followed by a digit or a BOM always ends a record.
     let d = load(&format!("{data_dir}/records.csv"));
@@ -368,7 +361,6 @@ fn main() {
     }
     starts.push(d.len());
 
-    marks += &format!("_1x{}", t0.elapsed().as_micros());
     // 3. Parse and aggregate every chunk in parallel, all threads sharing one name table, in rounds
     //    of about ROUND bytes per thread so the buckets stay in cache.
     let groups = unmatched + 1;
@@ -395,32 +387,19 @@ fn main() {
                 // This thread's group masks: those of slots lo..hi.
                 let (lo, hi) = (((t << NAME_BITS) + nt - 1) / nt, (((t + 1) << NAME_BITS) + nt - 1) / nt);
                 let mut masks = vec![[0u64; 4]; hi - lo];
-                let (mut run_us, mut wait_us, mut own_us) = (0u64, 0u64, 0u64);
                 for r in 0..rounds {
                     let out = unsafe { &mut *buckets[t].0.get() };
                     out.iter_mut().for_each(Vec::clear);
-                    let c0 = std::time::Instant::now();
                     chunk.run(ctx, s + (e - s) * (r + 1) / rounds, out);
-                    run_us += c0.elapsed().as_micros() as u64;
-                    let c0 = std::time::Instant::now();
                     barrier.wait();
-                    wait_us += c0.elapsed().as_micros() as u64;
-                    let c0 = std::time::Instant::now();
                     for b in buckets {
                         for &x in &unsafe { &*b.0.get() }[t] {
                             let (i, g) = ((x >> 8) as usize - lo, (x & 255) as usize);
                             masks[i][g / 64] |= 1 << (g % 64);
                         }
                     }
-                    own_us += c0.elapsed().as_micros() as u64;
-                    let c0 = std::time::Instant::now();
                     barrier.wait();
-                    wait_us += c0.elapsed().as_micros() as u64;
                 }
-                RUN.fetch_add(run_us, Relaxed);
-                RUNMAX.fetch_max(run_us, Relaxed);
-                WAIT.fetch_add(wait_us, Relaxed);
-                OWN.fetch_add(own_us, Relaxed);
                 // 4. Each group's distinct names are the masks with its bit set.
                 let mut c = vec![0i64; groups];
                 for m in &masks {
@@ -441,7 +420,6 @@ fn main() {
     let parts: Vec<&Vec<Agg>> = parts.iter().map(|p| &p.0).collect();
     let distinct: Vec<i64> = (0..groups).map(|g| counts.iter().map(|c| c[g]).sum()).collect();
 
-    marks += &format!("_2x{}", t0.elapsed().as_micros());
     let mut o = Vec::new();
     for g in 0..groups {
         let mut a = parts[0][g];
@@ -462,6 +440,4 @@ fn main() {
         writeln!(o, "{key} {} {} {} {} {} {} {} {}", a.count, a.id_sum, money(a.amount_sum), money(a.min), money(a.max), distinct[g], a.name_bytes, a.note_bytes).unwrap();
     }
     std::fs::write(format!("{out_dir}/aggregates.txt"), o).unwrap();
-    marks += &format!("_ex{}_run{}_max{}_wait{}_own{}_nt{}_rounds{}", t0.elapsed().as_micros(), RUN.load(Relaxed) / nt as u64, RUNMAX.load(Relaxed), WAIT.load(Relaxed) / nt as u64, OWN.load(Relaxed) / nt as u64, nt, rounds);
-    std::fs::write(format!("{out_dir}/PROFC{marks}"), b"").unwrap();
 }
