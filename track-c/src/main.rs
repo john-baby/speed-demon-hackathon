@@ -1,5 +1,6 @@
 // Speed Demon 2026, Track C (Join). See README.md for the approach.
 use std::io::Write;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::thread;
 
 // Map the input read-only; the host has it in the page cache, so it is not charged to us.
@@ -73,14 +74,16 @@ fn text<'a>(d: &'a [u8], p: &mut usize) -> (&'a [u8], usize) {
     (&d[s + 1..i], escapes)
 }
 
-fn hash(s: &[u8]) -> u64 {
-    let mut h = s.len() as u64;
-    for c in s.chunks(8) {
-        let mut w = [0u8; 8];
-        w[..c.len()].copy_from_slice(c);
-        h = (h.rotate_left(5) ^ u64::from_le_bytes(w)).wrapping_mul(0x517c_c1b7_2722_0a95);
-    }
-    h ^ h >> 29
+fn word(d: &[u8], i: usize) -> u64 {
+    u64::from_le_bytes(d[i..i + 8].try_into().unwrap())
+}
+
+// Names are short: hash the length and the first and last 8 bytes. A record always follows a name,
+// so the 8-byte read at s is in bounds.
+fn hash(d: &[u8], s: usize, len: usize) -> u64 {
+    let (head, tail) = if len >= 8 { (word(d, s), word(d, s + len - 8)) } else { (word(d, s) & ((1u64 << (8 * len)) - 1), 0) };
+    let h = (head ^ tail.rotate_left(29) ^ len as u64).wrapping_mul(0x517c_c1b7_2722_0a95);
+    h ^ h >> 32
 }
 
 #[derive(Clone, Copy)]
@@ -94,62 +97,51 @@ struct Agg {
     note_bytes: i64,
 }
 
-// A set of distinct names, each with a bitmask of the groups it occurs in (`words` u64s per name).
-struct Names<'a> {
+// Distinct names across all threads: a lock-free open-addressing table. A slot holds a name's file
+// offset, length and hash tag in one word (claimed by compare-and-swap); the name's bitmask of the
+// groups it occurs in sits at the same index in `masks`.
+struct Names {
+    slots: Vec<AtomicU64>,
+    masks: Vec<AtomicU64>,
     words: usize,
-    names: Vec<&'a [u8]>,
-    hashes: Vec<u64>,
-    masks: Vec<u64>,
-    slots: Vec<u32>, // open addressing, id + 1, 0 = empty
 }
 
-impl<'a> Names<'a> {
-    fn new(words: usize) -> Self {
-        Names { words, names: vec![], hashes: vec![], masks: vec![], slots: vec![0; 1 << 12] }
-    }
+const NAME_BITS: u32 = 18; // the generator draws names from a pool of 100,000
 
-    // The mask of a name, added empty if new.
-    fn mask(&mut self, name: &'a [u8], h: u64) -> &mut [u64] {
-        let mask = self.slots.len() - 1;
-        let mut i = h as usize & mask;
-        let id = loop {
-            match self.slots[i] {
-                0 => {
-                    self.names.push(name);
-                    self.hashes.push(h);
-                    self.masks.resize(self.names.len() * self.words, 0);
-                    self.slots[i] = self.names.len() as u32;
-                    if self.names.len() * 2 > self.slots.len() {
-                        self.grow();
-                    }
-                    break self.names.len() - 1;
-                }
-                s if self.hashes[s as usize - 1] == h && self.names[s as usize - 1] == name => break s as usize - 1,
-                _ => i = (i + 1) & mask,
-            }
+impl Names {
+    fn add(&self, d: &[u8], s: usize, len: usize, g: usize) {
+        let h = hash(d, s, len);
+        let entry = (s as u64) << 32 | (len as u64) << 16 | h & 0xffff;
+        let same = |e: u64| e & 0xffff_ffff == entry & 0xffff_ffff && {
+            let o = (e >> 32) as usize;
+            d[o..o + len] == d[s..s + len]
         };
-        &mut self.masks[id * self.words..(id + 1) * self.words]
-    }
-
-    fn grow(&mut self) {
-        self.slots = vec![0; self.slots.len() * 2];
         let mask = self.slots.len() - 1;
-        for (id, &h) in self.hashes.iter().enumerate() {
-            let mut i = h as usize & mask;
-            while self.slots[i] != 0 {
-                i = (i + 1) & mask;
+        let mut i = (h >> (64 - NAME_BITS)) as usize;
+        loop {
+            let cur = self.slots[i].load(Relaxed);
+            let found = if cur == 0 {
+                match self.slots[i].compare_exchange(0, entry, Relaxed, Relaxed) {
+                    Ok(_) => true,
+                    Err(now) => same(now),
+                }
+            } else {
+                same(cur)
+            };
+            if found {
+                self.masks[i * self.words + g / 64].fetch_or(1 << (g % 64), Relaxed);
+                return;
             }
-            self.slots[i] = id as u32 + 1;
+            i = (i + 1) & mask;
         }
     }
 }
 
 // Parse the records in d[start..end] (start is a record start, outside quotes) and aggregate them
 // by group: region_of[region_id] is the region's group, and a missing region is group `unmatched`.
-fn parse<'a>(d: &'a [u8], start: usize, end: usize, region_of: &[u16], unmatched: usize) -> (Vec<Agg>, Names<'a>) {
+fn parse(d: &[u8], start: usize, end: usize, region_of: &[u16], unmatched: usize, names: &Names) -> Vec<Agg> {
     let empty = Agg { count: 0, id_sum: 0, amount_sum: 0, min: i64::MAX, max: i64::MIN, name_bytes: 0, note_bytes: 0 };
     let mut aggs = vec![empty; unmatched + 1];
-    let mut names = Names::new(unmatched / 64 + 1);
     let mut p = start;
     while p < end {
         if d[p..].starts_with(BOM) {
@@ -175,9 +167,9 @@ fn parse<'a>(d: &'a [u8], start: usize, end: usize, region_of: &[u16], unmatched
         a.max = a.max.max(cents);
         a.name_bytes += (name.len() - name_esc) as i64;
         a.note_bytes += (note.len() - note_esc) as i64;
-        names.mask(name, hash(name))[g / 64] |= 1 << (g % 64);
+        names.add(d, name.as_ptr() as usize - d.as_ptr() as usize, name.len(), g);
     }
-    (aggs, names)
+    aggs
 }
 
 fn money(c: i64) -> String {
@@ -199,13 +191,22 @@ fn main() {
         rows.push((id, &r[p..p + 3]));
         p += 4;
     }
-    let mut codes: Vec<&[u8]> = rows.iter().map(|&(_, c)| c).collect();
-    codes.sort_unstable();
-    codes.dedup();
+    let code = |c: &[u8]| ((c[0] - b'A') as usize * 26 + (c[1] - b'A') as usize) * 26 + (c[2] - b'A') as usize;
+    let mut rank = vec![0u16; 26 * 26 * 26];
+    for &(_, c) in &rows {
+        rank[code(c)] = 1;
+    }
+    let mut codes = Vec::new();
+    for (k, r) in rank.iter_mut().enumerate() {
+        if *r == 1 {
+            *r = codes.len() as u16;
+            codes.push([b'A' + (k / 676) as u8, b'A' + (k / 26 % 26) as u8, b'A' + (k % 26) as u8]);
+        }
+    }
     let unmatched = codes.len();
     let mut region_of = vec![unmatched as u16; rows.iter().map(|&(id, _)| id + 1).max().unwrap_or(0)];
     for &(id, c) in &rows {
-        region_of[id] = codes.binary_search(&c).unwrap() as u16;
+        region_of[id] = rank[code(c)];
     }
 
     // 2. Split records.csv at record starts. A byte is inside quotes exactly when an odd number of
@@ -216,7 +217,7 @@ fn main() {
     let quotes: Vec<usize> = thread::scope(|sc| {
         let hs: Vec<_> = (0..nt).map(|i| {
             let part = &d[cuts[i]..cuts[i + 1]];
-            sc.spawn(move || part.iter().filter(|&&b| b == b'"').count())
+            sc.spawn(move || part.chunks(255).map(|c| c.iter().fold(0u8, |n, &b| n + (b == b'"') as u8) as usize).sum::<usize>())
         }).collect();
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
@@ -234,43 +235,38 @@ fn main() {
     }
     starts.push(d.len());
 
-    // 3. Parse and aggregate every chunk in parallel.
-    let parts: Vec<(Vec<Agg>, Names)> = thread::scope(|sc| {
+    // 3. Parse and aggregate every chunk in parallel, all threads sharing one name table.
+    let groups = unmatched + 1;
+    let words = groups.div_ceil(64);
+    let names = Names {
+        slots: (0..1 << NAME_BITS).map(|_| AtomicU64::new(0)).collect(),
+        masks: (0..words << NAME_BITS).map(|_| AtomicU64::new(0)).collect(),
+        words,
+    };
+    let parts: Vec<Vec<Agg>> = thread::scope(|sc| {
         let hs: Vec<_> = (0..nt).map(|i| {
-            let (s, e, region_of) = (starts[i], starts[i + 1], &region_of);
-            sc.spawn(move || parse(d, s, e, region_of, unmatched))
+            let (s, e, region_of, names) = (starts[i], starts[i + 1], &region_of, &names);
+            sc.spawn(move || parse(d, s, e, region_of, unmatched, names))
         }).collect();
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
 
-    // 4. Distinct names per group: merge the threads' name sets in parallel, each thread taking the
-    //    names whose hash falls in its shard, and count each group's bit over the merged masks.
-    let groups = unmatched + 1;
-    let distinct: Vec<Vec<i64>> = thread::scope(|sc| {
-        let hs: Vec<_> = (0..nt).map(|shard| {
-            let parts = &parts;
-            sc.spawn(move || {
-                let mut all = Names::new(groups / 64 + 1);
-                for (_, names) in parts {
-                    for (id, &h) in names.hashes.iter().enumerate() {
-                        if (h as u128 * nt as u128 >> 64) as usize == shard {
-                            let src = &names.masks[id * names.words..(id + 1) * names.words];
-                            for (w, s) in all.mask(names.names[id], h).iter_mut().zip(src) {
-                                *w |= s;
-                            }
-                        }
-                    }
-                }
-                (0..groups).map(|g| all.masks.chunks(all.words).filter(|m| m[g / 64] >> (g % 64) & 1 == 1).count() as i64).collect()
-            })
-        }).collect();
-        hs.into_iter().map(|h| h.join().unwrap()).collect()
-    });
+    // 4. Each group's distinct names are the masks with its bit set.
+    let mut distinct = vec![0i64; groups];
+    for m in names.masks.chunks(words) {
+        for (w, word) in m.iter().enumerate() {
+            let mut bits = word.load(Relaxed);
+            while bits != 0 {
+                distinct[w * 64 + bits.trailing_zeros() as usize] += 1;
+                bits &= bits - 1;
+            }
+        }
+    }
 
     let mut o = Vec::new();
     for g in 0..groups {
-        let mut a = parts[0].0[g];
-        for (aggs, _) in &parts[1..] {
+        let mut a = parts[0][g];
+        for aggs in &parts[1..] {
             let b = aggs[g];
             a.count += b.count;
             a.id_sum += b.id_sum;
@@ -283,9 +279,8 @@ fn main() {
         if a.count == 0 {
             continue;
         }
-        let key = if g == unmatched { "_UNMATCHED" } else { std::str::from_utf8(codes[g]).unwrap() };
-        let names: i64 = distinct.iter().map(|c| c[g]).sum();
-        writeln!(o, "{key} {} {} {} {} {} {names} {} {}", a.count, a.id_sum, money(a.amount_sum), money(a.min), money(a.max), a.name_bytes, a.note_bytes).unwrap();
+        let key = if g == unmatched { "_UNMATCHED" } else { std::str::from_utf8(&codes[g]).unwrap() };
+        writeln!(o, "{key} {} {} {} {} {} {} {} {}", a.count, a.id_sum, money(a.amount_sum), money(a.min), money(a.max), distinct[g], a.name_bytes, a.note_bytes).unwrap();
     }
     std::fs::write(format!("{out_dir}/aggregates.txt"), o).unwrap();
 }
