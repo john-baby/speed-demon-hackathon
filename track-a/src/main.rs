@@ -16,8 +16,7 @@ fn load(path: &str) -> &'static [u8] {
     if len == 0 {
         return &[];
     }
-    // PROT_READ, MAP_PRIVATE | MAP_POPULATE
-    let p = unsafe { mmap(std::ptr::null_mut(), len, 1, 0x2 | 0x8000, f.as_raw_fd(), 0) };
+    let p = unsafe { mmap(std::ptr::null_mut(), len, 1, 2, f.as_raw_fd(), 0) }; // PROT_READ, MAP_PRIVATE
     assert!(p as isize != -1, "mmap failed");
     unsafe { std::slice::from_raw_parts(p, len) }
 }
@@ -27,25 +26,27 @@ fn load(path: &str) -> &'static [u8] {
     std::fs::read(path).unwrap().leak()
 }
 
-// One thread's view of its chunk: records plus its own endpoint table.
+fn word(d: &[u8], i: usize) -> u64 {
+    u64::from_le_bytes(d[i..i + 8].try_into().unwrap())
+}
+
+// One thread's view of its chunk, with its own endpoint ids.
 struct Chunk<'a> {
-    recs: Vec<u64>, // endpoint id << 40 | is_5xx << 39 | hour << 32 | latency
+    recs: Vec<u64>,          // endpoint id << 40 | hour << 32 | latency
+    tally: Vec<[u32; 2]>,    // [count, 5xx count] at id * HOURS + hour
     names: Vec<&'a [u8]>,
-    slots: Vec<u32>, // open addressing, id + 1, 0 = empty
+    slots: Vec<u32>,         // open addressing, id + 1, 0 = empty
 }
 
 impl<'a> Chunk<'a> {
-    fn id(&mut self, ep: &'a [u8]) -> u64 {
-        let mut h = ep.len() as u64;
-        for &b in ep {
-            h = (h.rotate_left(5) ^ b as u64).wrapping_mul(0x517c_c1b7_2722_0a95);
-        }
+    fn id(&mut self, ep: &'a [u8], h: u64) -> u64 {
         let mask = self.slots.len() - 1;
         let mut i = (h >> 40) as usize & mask;
         loop {
             match self.slots[i] {
                 0 => {
                     self.names.push(ep);
+                    self.tally.resize(self.names.len() * HOURS, [0; 2]);
                     self.slots[i] = self.names.len() as u32;
                     return self.names.len() as u64 - 1;
                 }
@@ -57,12 +58,12 @@ impl<'a> Chunk<'a> {
 }
 
 fn parse(d: &[u8]) -> Chunk<'_> {
-    let mut c = Chunk { recs: Vec::with_capacity(d.len() / 70), names: Vec::new(), slots: vec![0; 1 << 14] };
+    let mut c = Chunk { recs: Vec::with_capacity(d.len() / 70), tally: Vec::new(), names: Vec::new(), slots: vec![0; 1 << 14] };
     let digit = |i: usize| (d[i] - b'0') as u64;
     let mut p = 0;
     while p < d.len() {
         let day = digit(p + 8) * 10 + digit(p + 9);
-        let hour = (if day >= 30 { day - 30 } else { day + 1 }) * 24 +digit(p + 11) * 10 + digit(p + 12) - 18;
+        let hour = (if day >= 30 { day - 30 } else { day + 1 }) * 24 + digit(p + 11) * 10 + digit(p + 12) - 18;
         // Skip the method by its first letters: GET DELETE HEAD OPTIONS POST PUT PATCH.
         let s = p + match (d[p + 28], d[p + 29]) {
             (b'G', _) | (b'P', b'U') => 32,
@@ -71,19 +72,38 @@ fn parse(d: &[u8]) -> Chunk<'_> {
             (b'D', _) => 35,
             _ => 36,
         };
-        let mut e = s + 1;
-        while d[e] != b' ' {
-            e += 1;
+        // Find the space after the endpoint 8 bytes at a time. At least " 100 0\n" follows
+        // the endpoint's first byte, so an 8-byte read at s is always in bounds.
+        let mut e = s;
+        loop {
+            if e + 8 > d.len() {
+                while d[e] != b' ' {
+                    e += 1;
+                }
+                break;
+            }
+            let w = word(d, e) ^ 0x2020_2020_2020_2020;
+            let z = w.wrapping_sub(0x0101_0101_0101_0101) & !w & 0x8080_8080_8080_8080;
+            if z != 0 {
+                e += z.trailing_zeros() as usize / 8;
+                break;
+            }
+            e += 8;
         }
-        let id = c.id(&d[s..e]);
-        let err = (d[e + 1] == b'5') as u64;
+        let len = e - s;
+        let (head, tail) = if len >= 8 { (word(d, s), word(d, e - 8)) } else { (word(d, s) & ((1 << (8 * len)) - 1), 0) };
+        let h = (head ^ tail.rotate_left(29) ^ len as u64).wrapping_mul(0x517c_c1b7_2722_0a95);
+        let id = c.id(&d[s..e], h);
+        let t = &mut c.tally[id as usize * HOURS + hour as usize];
+        t[0] += 1;
+        t[1] += (d[e + 1] == b'5') as u32;
         let mut q = e + 5;
         let mut lat = 0;
         while d[q] != b'\n' {
             lat = lat * 10 + digit(q);
             q += 1;
         }
-        c.recs.push(id << 40 | err << 39 | hour << 32 | lat);
+        c.recs.push(id << 40 | hour << 32 | lat);
         p = q + 1;
     }
     c
@@ -116,7 +136,7 @@ fn main() {
     let d = load(&format!("{data_dir}/requests.log"));
     let nt = thread::available_parallelism().map_or(1, |n| n.get());
 
-    // 1. Split at line starts and parse every chunk in parallel.
+    // 1. Split at line starts and parse and count every chunk in parallel.
     let mut bounds = vec![0];
     for i in 1..nt {
         let mut x = (d.len() * i / nt).max(bounds[i - 1]);
@@ -126,7 +146,7 @@ fn main() {
         bounds.push(x);
     }
     bounds.push(d.len());
-    let chunks: Vec<Chunk> = thread::scope(|sc| {
+    let mut chunks: Vec<Chunk> = thread::scope(|sc| {
         let hs: Vec<_> = (0..nt).map(|i| {
             let part = &d[bounds[i]..bounds[i + 1]];
             sc.spawn(move || parse(part))
@@ -140,47 +160,39 @@ fn main() {
     names.dedup();
     let ne = names.len();
     let nk = HOURS * ne;
-    let ranks: Vec<Vec<usize>> = chunks.iter()
-        .map(|c| c.names.iter().map(|n| names.binary_search(n).unwrap()).collect())
-        .collect();
-    let key = |r: u64, rank: &[usize]| (r >> 32 & 0x7f) as usize * ne + rank[(r >> 40) as usize];
+    let local: Vec<Vec<usize>> = chunks.iter().map(|c| {
+        let mut l = vec![usize::MAX; ne];
+        for (id, n) in c.names.iter().enumerate() {
+            l[names.binary_search(n).unwrap()] = id;
+        }
+        l
+    }).collect();
 
-    // 3. Per-thread [count, errors] per key.
-    let mut tallies: Vec<Vec<[u32; 2]>> = thread::scope(|sc| {
-        let hs: Vec<_> = chunks.iter().zip(&ranks).map(|(c, rank)| sc.spawn(move || {
-            let mut t = vec![[0u32; 2]; nk];
-            for &r in &c.recs {
-                let k = &mut t[key(r, rank)];
-                k[0] += 1;
-                k[1] += (r >> 39 & 1) as u32;
-            }
-            t
-        })).collect();
-        hs.into_iter().map(|h| h.join().unwrap()).collect()
-    });
-
-    // 4. Turn counts into each thread's write offset in one key-ordered latency array.
+    // 3. Turn each thread's counts into its write offsets in one key-ordered latency array.
     let mut start = vec![0usize; nk + 1];
     let mut errors = vec![0u32; nk];
     let mut total = 0;
     for k in 0..nk {
         start[k] = total;
-        for t in tallies.iter_mut() {
-            errors[k] += t[k][1];
-            total += t[k][0] as usize;
-            t[k][0] = (total - t[k][0] as usize) as u32;
+        for (c, l) in chunks.iter_mut().zip(&local) {
+            if let Some(&id) = l.get(k % ne).filter(|&&id| id != usize::MAX) {
+                let t = &mut c.tally[id * HOURS + k / ne];
+                errors[k] += t[1];
+                total += t[0] as usize;
+                t[0] = (total - t[0] as usize) as u32;
+            }
         }
     }
     start[nk] = total;
 
-    // 5. Scatter latencies; the threads write disjoint slots.
+    // 4. Scatter latencies; the threads write disjoint slots.
     let mut lats = vec![0u32; total];
     let out = Shared(lats.as_mut_ptr());
     thread::scope(|sc| {
-        for ((c, rank), t) in chunks.iter().zip(&ranks).zip(tallies.iter_mut()) {
+        for c in chunks.iter_mut() {
             sc.spawn(move || {
                 for &r in &c.recs {
-                    let slot = &mut t[key(r, rank)][0];
+                    let slot = &mut c.tally[(r >> 40) as usize * HOURS + (r >> 32 & 0xff) as usize][0];
                     unsafe { *out.at(*slot as usize) = r as u32 };
                     *slot += 1;
                 }
@@ -188,9 +200,8 @@ fn main() {
         }
     });
     drop(chunks);
-    drop(tallies);
 
-    // 6. Nearest-rank percentiles by selection, over key ranges of roughly equal line counts.
+    // 5. Nearest-rank percentiles by selection, over key ranges of roughly equal line counts.
     let mut kb = vec![0];
     for i in 1..nt {
         kb.push(start.partition_point(|&s| s < total * i / nt).min(nk));
