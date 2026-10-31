@@ -38,11 +38,32 @@ fn num(d: &[u8], p: &mut usize) -> u64 {
     x
 }
 
+// num without a loop when the number and its separator lie in the next 8 bytes: separators (space,
+// LF) are the bytes without bit 4 set, which gives the length; the digits are then shifted to the
+// top, so the bytes below them read as zeros, and combined in pairs, then pairs of pairs.
+fn field(d: &[u8], p: &mut usize) -> u64 {
+    if let Some(b) = d.get(*p..*p + 8) {
+        let w = u64::from_le_bytes(b.try_into().unwrap());
+        let seps = !w & 0x1010_1010_1010_1010;
+        if seps != 0 {
+            let len = seps.trailing_zeros() as usize / 8;
+            let keep = (1u64 << (8 * len)) - 1;
+            let mut x = ((w & keep) - (0x3030_3030_3030_3030 & keep)) << (64 - 8 * len);
+            x = x.wrapping_mul(10).wrapping_add(x >> 8) & 0x00ff_00ff_00ff_00ff;
+            x = x.wrapping_mul(100).wrapping_add(x >> 16) & 0x0000_ffff_0000_ffff;
+            x = x.wrapping_mul(10000).wrapping_add(x >> 32) & 0xffff_ffff;
+            *p += len + 1;
+            return x;
+        }
+    }
+    num(d, p)
+}
+
 // Call f(u, v, w) for every edge line in the chunk. Self-loops never shorten a path, so skip them.
 fn each_edge(d: &[u8], mut f: impl FnMut(usize, usize, u32)) {
     let mut p = 0;
     while p < d.len() {
-        let (u, v, w) = (num(d, &mut p) as usize, num(d, &mut p) as usize, num(d, &mut p) as u32);
+        let (u, v, w) = (field(d, &mut p) as usize, field(d, &mut p) as usize, field(d, &mut p) as u32);
         if u != v {
             f(u, v, w);
         }
