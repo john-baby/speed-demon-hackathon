@@ -153,7 +153,10 @@ impl Chunk {
 }
 
 // The only pass over the input: intern each line's endpoint and append its latency to its group.
-fn parse(c: &mut Chunk, d: &[u8]) {
+fn parse(d: &[u8]) -> Chunk {
+    let blocks = d.len() / 512; // about what typical lines need
+    let mut c = Chunk { t: Names::new(), groups: vec![Vec::new(); HOURS],
+        lats: Vec::with_capacity(blocks), prev: Vec::with_capacity(blocks) };
     // Every line has exactly four spaces and a newline, so the separators, in order, come in
     // fives and no field is ever searched for. They are collected 64 bytes at a time.
     let (mut sep, mut n) = ([0usize; 192], 0);
@@ -204,6 +207,7 @@ fn parse(c: &mut Chunk, d: &[u8]) {
         sep.copy_within(i..n, 0);
         n -= i;
     }
+    c
 }
 
 // Appends x in decimal; much cheaper than `write!`.
@@ -237,38 +241,20 @@ fn main() {
     let d = load(&format!("{data_dir}/requests.log"));
     let nt = thread::available_parallelism().map_or(1, |n| n.get());
 
-    // 1. Cut the input at line starts into eight pieces per thread. Each thread parses its
-    // own run of pieces in order (nearby lines share hours, which keeps its groups few), then
-    // takes what is left of the others' runs, so a slower core ends up with fewer.
-    let pieces = 8 * nt;
+    // 1. Split at line starts and parse every chunk in parallel.
     let mut bounds = vec![0];
-    for i in 1..pieces {
-        let mut x = (d.len() * i / pieces).max(bounds[i - 1]);
+    for i in 1..nt {
+        let mut x = (d.len() * i / nt).max(bounds[i - 1]);
         while x > 0 && x < d.len() && d[x - 1] != b'\n' {
             x += 1;
         }
         bounds.push(x);
     }
     bounds.push(d.len());
-    let taken: Vec<AtomicUsize> = (0..nt).map(|_| AtomicUsize::new(0)).collect();
     let chunks: Vec<Chunk> = thread::scope(|sc| {
-        let hs: Vec<_> = (0..nt).map(|t| {
-            let (bounds, taken) = (&bounds, &taken);
-            sc.spawn(move || {
-                let blocks = d.len() / nt / 512; // about what typical lines need
-                let mut c = Chunk { t: Names::new(), groups: vec![Vec::new(); HOURS],
-                    lats: Vec::with_capacity(blocks), prev: Vec::with_capacity(blocks) };
-                for r in (t..t + nt).map(|r| r % nt) {
-                    loop {
-                        let i = 8 * r + taken[r].fetch_add(1, Ordering::Relaxed);
-                        if i >= 8 * r + 8 {
-                            break;
-                        }
-                        parse(&mut c, &d[bounds[i]..bounds[i + 1]]);
-                    }
-                }
-                c
-            })
+        let hs: Vec<_> = (0..nt).map(|i| {
+            let part = &d[bounds[i]..bounds[i + 1]];
+            sc.spawn(move || parse(part))
         }).collect();
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
