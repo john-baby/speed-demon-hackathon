@@ -239,7 +239,7 @@ fn main() {
     let data_dir = args.get(1).map_or("/data", |s| s.as_str());
     let out_dir = args.get(2).map_or("/out", |s| s.as_str());
     let d = load(&format!("{data_dir}/requests.log"));
-    let nt = thread::available_parallelism().map_or(1, |n| n.get().div_ceil(2)); // one per core, not per hyperthread
+    let nt = thread::available_parallelism().map_or(1, |n| n.get() * 2); // smaller chunks even out uneven cores
 
     // 1. Split at line starts and parse every chunk in parallel.
     let mut bounds = vec![0];

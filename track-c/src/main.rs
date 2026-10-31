@@ -319,7 +319,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let data_dir = args.get(1).map_or("/data", |s| s.as_str());
     let out_dir = args.get(2).map_or("/out", |s| s.as_str());
-    let nt = (thread::available_parallelism().map_or(1, |n| n.get()) / 2).max(1); // one thread per core
+    let nt = 2 * thread::available_parallelism().map_or(1, |n| n.get()); // oversubscribe so slow cores hold less
 
     // 1. Regions, in parallel: code_of[region_id] is the region's country code as a number below
     //    26^3, and rank[code] its group (the code's place in sorted order); the threads fill
