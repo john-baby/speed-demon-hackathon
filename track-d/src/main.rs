@@ -436,12 +436,15 @@ fn main() {
     let chunks: Vec<&[u8]> = (0..nt).map(|i| &body[bounds[i]..bounds[i + 1]]).collect();
 
     // 1. Parse each chunk once, sending every edge to the bucket of its tail's part: part p holds
-    //    nodes lo(p)..lo(p + 1), and thread t owns SUB consecutive parts, small enough that placing a
-    //    part's edges writes into a region that fits in cache.
+    //    the 2^shift nodes from p << shift, a shift instead of a division per edge, and thread t owns
+    //    parts first(t)..first(t + 1), at least SUB of them, each small enough that placing its
+    //    edges writes into a region that fits in cache.
     const SUB: usize = 8;
-    let parts = nt * SUB;
-    let lo = |p: usize| (n * p).div_ceil(parts);
-    let part = |u: usize| u * parts / n;
+    let shift = (n / (nt * SUB)).max(1).ilog2();
+    let parts = n.div_ceil(1 << shift);
+    let first = |t: usize| parts * t / nt;
+    let range = |t: usize| (first(t) << shift, (first(t + 1) << shift).min(n));
+    let part = |u: usize| u >> shift;
     let buckets: Vec<Vec<Vec<[u32; 3]>>> = thread::scope(|sc| {
         let hs: Vec<_> = chunks.iter().map(|c| sc.spawn(move || {
             let mut out: Vec<Vec<[u32; 3]>> = (0..parts).map(|_| Vec::with_capacity(c.len() / 18 / parts + 64)).collect();
@@ -459,9 +462,9 @@ fn main() {
         let hs: Vec<_> = (0..nt).map(|t| {
             let buckets = &buckets;
             sc.spawn(move || {
-                let (a, b) = (lo(t * SUB), lo((t + 1) * SUB));
+                let (a, b) = range(t);
                 let off = unsafe { std::slice::from_raw_parts_mut(fo.at(a), b - a) };
-                for e in (t * SUB..(t + 1) * SUB).flat_map(|p| buckets.iter().flat_map(move |out| &out[p])) {
+                for e in (first(t)..first(t + 1)).flat_map(|p| buckets.iter().flat_map(move |out| &out[p])) {
                     off[e[0] as usize - a] += 1;
                 }
                 let mut total = 0;
@@ -482,10 +485,10 @@ fn main() {
         for t in 0..nt {
             let (buckets, base) = (&buckets, base[t]);
             sc.spawn(move || {
-                let (a, b) = (lo(t * SUB), lo((t + 1) * SUB));
+                let (a, b) = range(t);
                 let off = unsafe { std::slice::from_raw_parts_mut(fo.at(a), b - a) };
                 let mut next: Vec<u32> = off.to_vec();
-                for e in (t * SUB..(t + 1) * SUB).flat_map(|p| buckets.iter().flat_map(move |out| &out[p])) {
+                for e in (first(t)..first(t + 1)).flat_map(|p| buckets.iter().flat_map(move |out| &out[p])) {
                     let x = &mut next[e[0] as usize - a];
                     unsafe { *fa.at((base + *x) as usize) = [e[1], e[2]] };
                     *x += 1;
