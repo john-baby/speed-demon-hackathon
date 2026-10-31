@@ -337,6 +337,14 @@ impl<'g, K: Key> Side<'g, K> {
     fn step(&mut self, other: &Self, best: &mut u64) -> bool {
         let (d, u) = self.heap.pop().unwrap().0.split();
         let g = self.g;
+        // The node now on top is likely the next one settled: start fetching its edges.
+        if let Some(&Reverse(k)) = self.heap.peek() {
+            let next = k.split().1 as usize;
+            prefetch(&g.off[next]);
+            if let Some(e) = g.adj.get(g.off[next] as usize) {
+                prefetch(e);
+            }
+        }
         for &[v, w] in &g.adj[g.off[u as usize] as usize..g.off[u as usize + 1] as usize] {
             let nd = d + w as u64;
             if nd < K::load(self.dist.get(v)) {
