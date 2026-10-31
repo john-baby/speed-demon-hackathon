@@ -179,24 +179,55 @@ impl Map {
     }
 }
 
-// One direction of a bidirectional Dijkstra search.
-struct Side<'g> {
-    g: &'g Graph,
-    dist: Map,
-    heap: BinaryHeap<Reverse<(u64, u32)>>,
+// A heap entry: a tentative distance and its node, ordered by distance. Most searches use one u64,
+// distance << 21 | node, which is half the size and compares in one instruction; a search whose
+// distances outgrow 43 bits is run again with plain pairs.
+trait Key: Ord + Copy {
+    fn make(d: u64, u: u32) -> Option<Self>;
+    fn split(self) -> (u64, u32);
 }
 
-impl<'g> Side<'g> {
+impl Key for u64 {
+    fn make(d: u64, u: u32) -> Option<u64> {
+        (d >> 43 == 0).then_some(d << 21 | u as u64)
+    }
+    fn split(self) -> (u64, u32) {
+        (self >> 21, self as u32 & 0x1f_ffff)
+    }
+}
+
+impl Key for (u64, u32) {
+    fn make(d: u64, u: u32) -> Option<Self> {
+        Some((d, u))
+    }
+    fn split(self) -> (u64, u32) {
+        self
+    }
+}
+
+// One direction of a bidirectional Dijkstra search.
+struct Side<'g, K> {
+    g: &'g Graph,
+    dist: Map,
+    heap: BinaryHeap<Reverse<K>>,
+}
+
+impl<'g, K: Key> Side<'g, K> {
+    fn new(g: &'g Graph) -> Self {
+        Side { g, dist: Map::new(g.off.len() - 1), heap: BinaryHeap::new() }
+    }
+
     fn reset(&mut self, from: u32) {
         self.dist.clear();
         self.heap.clear();
         self.dist.set(from, 0);
-        self.heap.push(Reverse((0, from)));
+        self.heap.push(Reverse(K::make(0, from).unwrap()));
     }
 
     // The smallest tentative distance still queued, dropping stale entries; MAX when empty.
     fn top(&mut self) -> u64 {
-        while let Some(&Reverse((d, u))) = self.heap.peek() {
+        while let Some(&Reverse(k)) = self.heap.peek() {
+            let (d, u) = k.split();
             if d == self.dist.get(u) {
                 return d;
             }
@@ -206,27 +237,31 @@ impl<'g> Side<'g> {
     }
 
     // Settle the top node and relax its edges; any node the other side has reached closes a path.
-    fn step(&mut self, other: &Side, best: &mut u64) {
-        let Reverse((d, u)) = self.heap.pop().unwrap();
+    // False when a distance does not fit K.
+    fn step(&mut self, other: &Self, best: &mut u64) -> bool {
+        let (d, u) = self.heap.pop().unwrap().0.split();
         let g = self.g;
         for &[v, w] in &g.adj[g.off[u as usize] as usize..g.off[u as usize + 1] as usize] {
             let nd = d + w as u64;
             if nd < self.dist.get(v) {
+                let Some(k) = K::make(nd, v) else { return false };
                 self.dist.set(v, nd);
-                self.heap.push(Reverse((nd, v)));
+                self.heap.push(Reverse(k));
                 let o = other.dist.get(v);
                 if o != u64::MAX {
                     *best = (*best).min(nd + o);
                 }
             }
         }
+        true
     }
 }
 
 // Stop once the two frontiers together cannot beat the best path found; an empty side tops at MAX.
-fn query(f: &mut Side, b: &mut Side, s: u32, t: u32) -> u64 {
+// None when a distance does not fit K.
+fn query<'g, K: Key>(f: &mut Side<'g, K>, b: &mut Side<'g, K>, s: u32, t: u32) -> Option<u64> {
     if s == t {
-        return 0;
+        return Some(0);
     }
     f.reset(s);
     b.reset(t);
@@ -234,14 +269,13 @@ fn query(f: &mut Side, b: &mut Side, s: u32, t: u32) -> u64 {
     loop {
         let (tf, tb) = (f.top(), b.top());
         if tf.saturating_add(tb) >= best {
-            return best;
+            return Some(best);
         }
         // Grow the smaller frontier: a side that is about to run dry (an island, a dead end)
         // finishes first instead of letting the other side flood the graph.
-        if f.heap.len() <= b.heap.len() {
-            f.step(b, &mut best);
-        } else {
-            b.step(f, &mut best);
+        let ok = if f.heap.len() <= b.heap.len() { f.step(b, &mut best) } else { b.step(f, &mut best) };
+        if !ok {
+            return None;
         }
     }
 }
@@ -343,18 +377,24 @@ fn main() {
         pairs.push((rank[num(&q, &mut p) as usize], rank[num(&q, &mut p) as usize]));
     }
     drop(rank);
+    let narrow = n <= 1 << 21; // node ids fit u64 heap keys
     let next = AtomicUsize::new(0);
     let answers: Vec<Vec<(usize, u64)>> = thread::scope(|sc| {
         let hs: Vec<_> = (0..nt).map(|_| {
             let (fwd, bwd, pairs, next) = (&fwd, &bwd, &pairs, &next);
             sc.spawn(move || {
-                let mut f = Side { g: fwd, dist: Map::new(n), heap: BinaryHeap::new() };
-                let mut b = Side { g: bwd, dist: Map::new(n), heap: BinaryHeap::new() };
+                let (mut f, mut b) = (Side::<u64>::new(fwd), Side::<u64>::new(bwd));
+                let (mut wf, mut wb) = (None, None);
                 let mut done = Vec::new();
                 loop {
                     let i = next.fetch_add(1, Relaxed);
                     let Some(&(s, t)) = pairs.get(i) else { return done };
-                    done.push((i, query(&mut f, &mut b, s, t)));
+                    let d = narrow.then(|| query(&mut f, &mut b, s, t)).flatten().unwrap_or_else(|| {
+                        let wf = wf.get_or_insert_with(|| Side::<(u64, u32)>::new(fwd));
+                        let wb = wb.get_or_insert_with(|| Side::<(u64, u32)>::new(bwd));
+                        query(wf, wb, s, t).unwrap()
+                    });
+                    done.push((i, d));
                 }
             })
         }).collect();
