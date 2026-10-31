@@ -4,14 +4,22 @@ The task, the input files and the exact output format are in the [spec](https://
 
 ## Approach
 
-Rust, standard library only, one binary (`src/main.rs`).
+Rust, standard library only, one binary (`src/main.rs`). Every phase runs on all cores. [PERF.md](PERF.md) logs each step with the board run that measured it.
 
 1. **Map, don't read.** `graph.txt` is `mmap`ed read-only and cut into one chunk per core at line boundaries.
-2. **Build the forward graph without an edge buffer.** The first parallel pass parses every line and counts out-degrees with atomic counters. A prefix sum turns the counts into offsets. The second pass parses again and drops each edge straight into its slot in a compressed adjacency array (`[head, weight]` pairs, 8 bytes per edge). The reverse graph is not built from the text at all; it comes from the renumbered forward graph (step 5). Self-loops are skipped, since they never shorten a path. Parallel edges and duplicate lines are kept; Dijkstra uses whichever is lightest.
-3. **Bidirectional Dijkstra per query.** A forward search runs from `s` over the forward graph and a backward search from `t` over the reverse graph. Each step expands whichever side has the smaller queue, so a side about to run dry (an island, a dead end) finishes first instead of letting the other side flood the graph. Whenever an edge relaxation reaches a node the other side has already reached, the sum is a candidate path length. The search stops once the two frontier keys together reach the best candidate. If either side's queue empties, nothing better can appear, so an unreachable target (one with no in-edges, a separate island) is found to be unreachable after touching only a handful of nodes. Distances are `u64`, because paths can exceed 2^32.
-4. **Small per-search state.** Tentative distances live in an open-addressing hash table, cleared by walking the slots it used; tables start at 2^12 slots, and one that a long search grew past 2^15 slots is replaced by a small one afterwards. A search therefore costs what it touches, and memory does not grow with the number of threads times the number of nodes.
-5. **Locality by renumbering.** Node ids are random, so a search jumps across 80 MB of adjacency on every step. After loading, every thread grows breadth-first regions from seed nodes in its own slice of the id range, claiming each node with an atomic flag. The threads' visiting orders, concatenated, become the new ids, and the forward graph is rebuilt in parallel in that order. The reverse graph is then its transpose: in-degrees counted, every edge placed backwards. Because an edge's two ends now have nearby ids, those counters and writes stay local. Nearby nodes then share cache lines and pages, which halves query time. Query endpoints are mapped through the same table.
-6. **Parallel queries.** Every core takes the next unanswered query from an atomic counter, and the answers are written in input order at the end.
+2. **Parse once, build without atomics.** Each thread parses its chunk once and sends every edge to the bucket of its tail's part. The id range is split into eight parts per thread. Numbers are read without a loop per digit: separators are the bytes without bit 4 set, so one 8-byte load gives a number's length, and three multiplies combine its digits. Each thread then owns eight consecutive parts. It counts its nodes' out-degrees and places their edges (`[head, weight]`, 8 bytes) with plain writes. Because a part's edges land in a region of about 400 KB, the scattered writes stay in cache. Self-loops are dropped, since they never shorten a path. Parallel edges and duplicate lines are kept, and Dijkstra uses whichever is lightest.
+3. **Renumber for locality while ordering.** Node ids are random, so without renumbering a search jumps across the whole graph on every step.
+   - Every thread grows breadth-first regions from seeds in its own slice of the ids. The threads' visiting orders, one after another, become the new ids.
+   - A thread claims a node by compare-and-swapping its provisional id (thread, place in that thread's order) into one atomic array. Reading a neighbour's slot therefore gives either nothing, in which case the reader claims it, or its id.
+   - Each thread writes a visited node's edges, renamed provisionally, while the BFS is reading them anyway. A final parallel pass maps provisional ids to final ones while copying the edges into place, and counts in-degrees.
+   - The old graph is read once, with software prefetches at three depths (offsets, edges, heads' slots) to keep several cache misses in flight.
+   - The reverse graph is the transpose of the renumbered forward graph. Since an edge's two ends now have nearby ids, its counters and writes stay local.
+4. **Bidirectional Dijkstra per query.** A forward search runs from `s` and a backward search from `t`, and each step expands the side with the smaller queue. A side about to run dry (an island, a dead end, a target with no in-edges) therefore finishes after a handful of nodes, instead of letting the other side flood the graph. A relaxation that reaches a node the other side has reached gives a candidate path. The search stops once the two frontier keys together reach the best candidate.
+5. **Cheap search state.**
+   - Distances live in a paged array. Renumbered searches touch few blocks of 1,024 consecutive ids, and only those get a page. A lookup is two array reads, and clearing costs only what the search touched.
+   - Distances are stored as `u32` and heap entries are one `u64` (`distance << 21 | node`). A search whose distances reach 2^32 - 1 (the spur and no-in-edge queries) is rerun with `u64` distances and pair entries, so answers above 2^32 stay exact.
+   - After each pop, the edges of the node left on top of the heap are prefetched, since it is usually the next one settled.
+6. **Parallel queries.** Every core takes the next unanswered query from an atomic counter. Answers are written in input order at the end.
 
 ## Dependencies
 
@@ -19,5 +27,6 @@ None.
 
 ## With another 24 hours
 
-- Fuse the renumbering into the build, so the forward edges are placed once, directly under their new ids.
-- Cut the atomic traffic in the build, for example with per-thread partial counts over node ranges.
+- Place the reverse graph in the same pass that fixes up the forward one, using in-degrees counted on the old ids, to save the transpose's pass over the edges.
+- Shrink the graphs, which are most of the memory (two copies of 5M 8-byte edges), for example by storing small weights in fewer bits.
+- A goal-directed search (landmarks) would settle far fewer nodes per query. Its preprocessing (full searches from each landmark) costs more than the 2,000 queries it would save at this scale, but would pay off with more queries.
