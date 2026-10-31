@@ -4,10 +4,12 @@ The task, the input files and the exact output format are in the [spec](https://
 
 ## Approach
 
+Submitted version: 0.169 s, 119 MB, 66.0 points on the live board (run-1225b94c6c80), against 72.69 s for the reference.
+
 Rust, standard library only, one binary (`src/main.rs`). Every phase runs on all cores. [PERF.md](PERF.md) logs each step with the board run that measured it.
 
 1. **Map, don't read.** `graph.txt` is `mmap`ed read-only and cut into one chunk per core at line boundaries.
-2. **Parse once, build without atomics.** Each thread parses its chunk once and sends every edge to the bucket of its tail's part. The id range is split into eight parts per thread. Numbers are read without a loop per digit: separators are the bytes without bit 4 set, so one 8-byte load gives a number's length, and three multiplies combine its digits. Each thread then owns eight consecutive parts. It counts its nodes' out-degrees and places their edges (`[head, weight]`, 8 bytes) with plain writes. Because a part's edges land in a region of about 400 KB, the scattered writes stay in cache. Self-loops are dropped, since they never shorten a path. Parallel edges and duplicate lines are kept, and Dijkstra uses whichever is lightest.
+2. **Parse once, build without atomics.** Each thread parses its chunk once and sends every edge to the bucket of its tail's part. The id range is split into power-of-two blocks of ids, at least eight per thread, so an edge's bucket is a shift rather than a division. Numbers are read without a loop per digit: separators are the bytes without bit 4 set, so one 8-byte load gives a number's length, and three multiplies combine its digits. Each thread then owns a run of consecutive parts. It counts its nodes' out-degrees and places their edges (`[head, weight]`, 8 bytes) with plain writes. Because a part's edges land in a region of about 400 KB, the scattered writes stay in cache. Self-loops are dropped, since they never shorten a path. Parallel edges and duplicate lines are kept, and Dijkstra uses whichever is lightest.
 3. **Renumber for locality while ordering.** Node ids are random, so without renumbering a search jumps across the whole graph on every step.
    - Every thread grows breadth-first regions from seeds in its own slice of the ids. The threads' visiting orders, one after another, become the new ids.
    - A thread claims a node by compare-and-swapping its provisional id (thread, place in that thread's order) into one atomic array. Reading a neighbour's slot therefore gives either nothing, in which case the reader claims it, or its id.

@@ -1,6 +1,16 @@
 # Track D: performance log
 
-Every step from the reference to your final version, each with the live-board run ID that measured it. Judges check that the run IDs exist and that each change moved the way you say it did.
+Every step from the reference to the submitted version, each with the live-board run that measured it. Reverted experiments are listed too, with why they were dropped.
+
+**Summary.** 72.69 s for the reference, then 1.43 s for the first Rust version, and **0.169 s / 119 MB / 66.0 points** for the submitted step 21 (run-1225b94c6c80). The big moves:
+- step 2: alternating searches by queue size, so islands no longer flood the graph;
+- steps 3, 4 and 16: renumbering nodes for locality, finally fused into the BFS ordering;
+- steps 8 and 11: paged distance arrays with u32 distances;
+- steps 10 and 13: an atomic-free, cache-sized build;
+- step 15: prefetching the next node's edges;
+- step 18: giving back long searches' pages.
+
+Board profiles (steps 7, 12, 15, 16 and 17) guided each change.
 
 | Step | Change | Run ID | T (s) | M (MB) | Points |
 |---|---|---|---|---|---|

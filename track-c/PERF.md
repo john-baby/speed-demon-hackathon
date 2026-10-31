@@ -1,6 +1,15 @@
 # Track C: performance log
 
-Every step from the reference to your final version, each with the live-board run ID that measured it. Judges check that the run IDs exist and that each change moved the way you say it did.
+Every step from the reference to the submitted version, each with the live-board run that measured it. Reverted experiments are listed too, with why they were dropped.
+
+**Summary.** 14.44 s for the reference, then 0.207 s for the first Rust version, and **0.048 s / 17 MB / 70.2 points** for the submitted step 11 (run-87949b19dc88). The big moves:
+- step 2: one shared lock-free name table;
+- step 4: record-boundary splitting from the spec's guarantees, instead of a quote-counting pass;
+- steps 5 and 7: prefetching the name slot and region entry one record ahead;
+- step 8: SIMD structural scanning, with group masks owned per thread so no cache line is written by two cores;
+- step 11: a register-resident record loop with loop-free numbers.
+
+Board profiles (steps 7, 10 and 11) guided each change.
 
 | Step | Change | Run ID | T (s) | M (MB) | Points |
 |---|---|---|---|---|---|

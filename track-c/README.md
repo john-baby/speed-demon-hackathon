@@ -2,6 +2,8 @@
 
 The task, the input files and the exact output format are in the [spec](https://github.com/hackathon-raptors/speed-demon-2026/blob/main/specs/c-join.md).
 
+Submitted version: 0.048 s, 17 MB, 70.2 points on the live board (run-87949b19dc88), against 14.44 s for the reference. [PERF.md](PERF.md) logs every step with the run that measured it.
+
 ## Approach
 
 Rust, standard library only, one binary (`src/main.rs`).
@@ -24,5 +26,5 @@ None.
 
 ## With another 24 hours
 
-- A board profile shows each thread spends about 45 ms parsing its 17 MB, about 160 ns per record (the box runs without turbo), while the rounds, owners and barriers cost about 4 ms. The next step is a parser with about half the instructions per record. A first attempt (AVX2 masks, delimiters scanned ahead, loop-free number parsing) measured no faster, so the cost is elsewhere, likely in the name probe's unpredictable loop and the per-record bookkeeping.
-- A SIMD tag array beside the name table (one byte per slot, 16 compared at once) would make most lookups a single slot read with no probing loop.
+- The latest board profile shows each thread parsing for 33-37 ms, plus 2-6 ms at barriers waiting for the slowest thread, and 4.8 ms at exit unmapping the 200 MB input. Reading the input into reused buffers instead of mapping it would remove the unmapping, and smaller, dynamically assigned chunks would even out the threads.
+- Getting a record's five delimiters out of the masks is now the largest single cost. A design that needs fewer instructions per delimiter is the next big step. Scanning ahead into a position array, and AVX2, measured no faster.

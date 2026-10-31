@@ -1,6 +1,14 @@
 # Track A: performance log
 
-Every step from the reference to your final version, each with the live-board run ID that measured it. Judges check that the run IDs exist and that each change moved the way you say it did.
+Every step from the reference to the submitted version, each with the live-board run that measured it. Reverted experiments are listed too, with why they were dropped.
+
+**Summary.** 32.05 s for the reference, then 0.114 s for the first Rust version, and **0.036 s / 39 MB / 75.5 points** for the submitted step 10 (run-f5b63b76f24a). The big moves:
+- step 2: page faults spread across the parsing threads;
+- step 3: two passes over the mapped file instead of a record buffer;
+- step 5: one SIMD pass that sends every latency straight to its (hour, endpoint) block chain;
+- step 6: a group table that grows only for hours a thread sees.
+
+The notes below record the profiles behind each step and what did not work.
 
 | Step | Change | Run ID | T (s) | M (MB) | Points |
 |---|---|---|---|---|---|
