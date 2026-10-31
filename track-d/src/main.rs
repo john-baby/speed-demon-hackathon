@@ -1,4 +1,6 @@
 // Speed Demon 2026, Track D (Traverse). See README.md for the approach.
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering::Relaxed};
 use std::thread;
@@ -189,63 +191,11 @@ impl Map {
     }
 }
 
-// Monotone priority queue for Dijkstra (a radix heap): an entry sits in the bucket of the highest
-// bit where its key differs from the last minimum, so a push is O(1), bucket 0 holds only entries
-// equal to the minimum, and an entry moves to a lower bucket a few times at most.
-struct Radix {
-    buckets: Vec<Vec<(u64, u32)>>,
-    last: u64,
-    len: usize,
-}
-
-impl Radix {
-    fn new() -> Radix {
-        Radix { buckets: (0..65).map(|_| Vec::new()).collect(), last: 0, len: 0 }
-    }
-
-    fn bucket(&self, k: u64) -> usize {
-        64 - (k ^ self.last).leading_zeros() as usize
-    }
-
-    fn push(&mut self, k: u64, v: u32) {
-        let b = self.bucket(k);
-        self.buckets[b].push((k, v));
-        self.len += 1;
-    }
-
-    // A minimum entry, after refilling bucket 0 from the lowest non-empty bucket if needed.
-    fn top(&mut self) -> Option<(u64, u32)> {
-        if self.buckets[0].is_empty() {
-            let i = (1..65).find(|&i| !self.buckets[i].is_empty())?;
-            let mut b = std::mem::take(&mut self.buckets[i]);
-            self.last = b.iter().map(|e| e.0).min().unwrap();
-            for &e in &b {
-                let j = self.bucket(e.0);
-                self.buckets[j].push(e);
-            }
-            b.clear();
-            self.buckets[i] = b;
-        }
-        self.buckets[0].last().copied()
-    }
-
-    fn pop(&mut self) {
-        self.buckets[0].pop();
-        self.len -= 1;
-    }
-
-    fn clear(&mut self) {
-        self.buckets.iter_mut().for_each(Vec::clear);
-        self.last = 0;
-        self.len = 0;
-    }
-}
-
 // One direction of a bidirectional Dijkstra search.
 struct Side<'g> {
     g: &'g Graph,
     dist: Map,
-    heap: Radix,
+    heap: BinaryHeap<Reverse<(u64, u32)>>,
 }
 
 impl<'g> Side<'g> {
@@ -253,12 +203,12 @@ impl<'g> Side<'g> {
         self.dist.clear();
         self.heap.clear();
         self.dist.set(from, 0);
-        self.heap.push(0, from);
+        self.heap.push(Reverse((0, from)));
     }
 
     // The smallest tentative distance still queued, dropping stale entries; MAX when empty.
     fn top(&mut self) -> u64 {
-        while let Some((d, u)) = self.heap.top() {
+        while let Some(&Reverse((d, u))) = self.heap.peek() {
             if d == self.dist.get(u) {
                 return d;
             }
@@ -269,14 +219,13 @@ impl<'g> Side<'g> {
 
     // Settle the top node and relax its edges; any node the other side has reached closes a path.
     fn step(&mut self, other: &Side, best: &mut u64) {
-        let (d, u) = self.heap.top().unwrap();
-        self.heap.pop();
+        let Reverse((d, u)) = self.heap.pop().unwrap();
         let g = self.g;
         for &[v, w] in &g.adj[g.off[u as usize] as usize..g.off[u as usize + 1] as usize] {
             let nd = d + w as u64;
             if nd < self.dist.get(v) {
                 self.dist.set(v, nd);
-                self.heap.push(nd, v);
+                self.heap.push(Reverse((nd, v)));
                 let o = other.dist.get(v);
                 if o != u64::MAX {
                     *best = (*best).min(nd + o);
@@ -301,7 +250,7 @@ fn query(f: &mut Side, b: &mut Side, s: u32, t: u32) -> u64 {
         }
         // Grow the smaller frontier: a side that is about to run dry (an island, a dead end)
         // finishes first instead of letting the other side flood the graph.
-        if f.heap.len <= b.heap.len {
+        if f.heap.len() <= b.heap.len() {
             f.step(b, &mut best);
         } else {
             b.step(f, &mut best);
@@ -411,8 +360,8 @@ fn main() {
         let hs: Vec<_> = (0..nt).map(|_| {
             let (fwd, bwd, pairs, next) = (&fwd, &bwd, &pairs, &next);
             sc.spawn(move || {
-                let mut f = Side { g: fwd, dist: Map::new(16), heap: Radix::new() };
-                let mut b = Side { g: bwd, dist: Map::new(16), heap: Radix::new() };
+                let mut f = Side { g: fwd, dist: Map::new(16), heap: BinaryHeap::new() };
+                let mut b = Side { g: bwd, dist: Map::new(16), heap: BinaryHeap::new() };
                 let mut done = Vec::new();
                 loop {
                     let i = next.fetch_add(1, Relaxed);
