@@ -385,8 +385,6 @@ fn query<'g, K: Key>(f: &mut Side<'g, K>, b: &mut Side<'g, K>, s: u32, t: u32) -
 }
 
 fn main() {
-    let t0 = std::time::Instant::now();
-    let mut marks = String::new();
     let args: Vec<String> = std::env::args().collect();
     let data_dir = args.get(1).map_or("/data", |s| s.as_str());
     let out_dir = args.get(2).map_or("/out", |s| s.as_str());
@@ -424,7 +422,6 @@ fn main() {
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
 
-    marks += &format!("_0x{}", t0.elapsed().as_micros());
     // 2. Each owner counts its nodes' out-degrees and places their edges in the forward graph; only
     //    the start of each owner's range in adj needs the others' totals.
     let mut off = vec![0u32; n + 1];
@@ -451,7 +448,6 @@ fn main() {
     let m = totals.iter().sum::<u32>();
     off[n] = m;
     let mut adj = vec![[0u32; 2]; m as usize];
-    marks += &format!("_1x{}", t0.elapsed().as_micros());
     let fa = Shared(adj.as_mut_ptr());
     thread::scope(|sc| {
         for t in 0..nt {
@@ -474,7 +470,6 @@ fn main() {
     drop(buckets);
     let fwd = Graph { off, adj };
 
-    marks += &format!("_2x{}", t0.elapsed().as_micros());
     // 3. Renumber nodes so a search walks nearby memory: every thread grows breadth-first regions
     //    from seeds in its own id range, claiming nodes with an atomic flag, and the threads'
     //    visiting orders, one after another, are the new numbering.
@@ -512,15 +507,12 @@ fn main() {
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
     drop(claimed);
-    marks += &format!("_3x{}", t0.elapsed().as_micros());
     let ins: Vec<AtomicU32> = (0..=n).map(|_| AtomicU32::new(0)).collect();
     let (fwd, rank) = renumber(fwd, &orders, &ins);
     drop(orders);
-    marks += &format!("_4x{}", t0.elapsed().as_micros());
     let bwd = transpose(&fwd, &ins, nt);
     drop(ins);
 
-    marks += &format!("_5x{}", t0.elapsed().as_micros());
     // 4. Answer the queries on every core, each thread taking the next unanswered one.
     let q = std::fs::read(format!("{data_dir}/queries.txt")).unwrap();
     let mut pairs = Vec::new();
@@ -553,7 +545,6 @@ fn main() {
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
 
-    marks += &format!("_6x{}", t0.elapsed().as_micros());
     let mut dist = vec![0; pairs.len()];
     for (i, a) in answers.into_iter().flatten() {
         dist[i] = a;
@@ -567,6 +558,4 @@ fn main() {
         }
     }
     std::fs::write(format!("{out_dir}/distances.txt"), o).unwrap();
-    marks += &format!("_ex{}", t0.elapsed().as_micros());
-    std::fs::write(format!("{out_dir}/PROFD{marks}"), b"").unwrap();
 }
