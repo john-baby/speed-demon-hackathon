@@ -14,11 +14,7 @@ fn load(path: &str) -> &'static [u8] {
     use std::os::unix::io::AsRawFd;
     extern "C" {
         fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
-        fn prctl(op: i32, ...) -> i32;
     }
-    // PR_SET_THP_DISABLE: transparent huge pages would round each thread's small, scattered
-    // allocations up to 2 MB of resident memory.
-    unsafe { prctl(41, 1u64, 0u64, 0u64, 0u64) };
     let f = std::fs::File::open(path).unwrap();
     let len = f.metadata().unwrap().len() as usize;
     if len == 0 {
