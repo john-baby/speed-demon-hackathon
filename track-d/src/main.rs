@@ -177,7 +177,12 @@ impl Map {
         }
     }
 
+    // Empty the table; one a long search grew past 2^17 slots goes back to the small size, so
+    // twelve threads do not each keep the largest table they ever needed.
     fn clear(&mut self) {
+        if self.keys.len() > 1 << 17 {
+            *self = Map::new(16);
+        }
         for i in self.used.drain(..) {
             self.keys[i] = EMPTY;
         }
@@ -400,6 +405,7 @@ fn main() {
     while p < q.len() {
         pairs.push((rank[num(&q, &mut p) as usize], rank[num(&q, &mut p) as usize]));
     }
+    drop(rank);
     let next = AtomicUsize::new(0);
     let answers: Vec<Vec<(usize, u64)>> = thread::scope(|sc| {
         let hs: Vec<_> = (0..nt).map(|_| {
