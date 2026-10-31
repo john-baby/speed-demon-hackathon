@@ -5,7 +5,7 @@ Every step from the reference to your final version, each with the live-board ru
 | Step | Change | Run ID | T (s) | M (MB) | Points |
 |---|---|---|---|---|---|
 | 0 | The reference, unchanged | | 56.35 | | 0 |
-| 1 | Rust rewrite: index only the query terms in one parallel mmap scan; all phrases matched during the scan by an Aho-Corasick automaton over term ids; BOOL posting lists by parallel counting sort; hybrid sorted-list / bitmap evaluation strictly left to right | | | | |
+| 1 | Rust rewrite: index only the query terms in one parallel mmap scan; all phrases matched during the scan by an Aho-Corasick automaton over term ids; BOOL posting lists by parallel counting sort; hybrid sorted-list / bitmap evaluation strictly left to right | run-9ab4fffdc3ce | 0.679 | 313.1 | 50.2 |
 
 ## Notes
 

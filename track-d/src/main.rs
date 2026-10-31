@@ -2,7 +2,7 @@
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::io::Write;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering::Relaxed};
 use std::thread;
 
 // Map the input read-only; the host has it in the page cache, so it is not charged to us.
@@ -75,6 +75,33 @@ fn offsets(count: &[AtomicU32]) -> Vec<u32> {
         start
     }).collect();
     off
+}
+
+// The same graph with node order[x] renamed x (rank is the inverse); threads fill disjoint ranges.
+fn renumber(g: Graph, order: &[u32], rank: &[u32], nt: usize) -> Graph {
+    let mut off = Vec::with_capacity(order.len() + 1);
+    let mut total = 0;
+    for &u in order {
+        off.push(total);
+        total += g.off[u as usize + 1] - g.off[u as usize];
+    }
+    off.push(total);
+    let mut adj = vec![[0u32; 2]; total as usize];
+    let out = Shared(adj.as_mut_ptr());
+    thread::scope(|sc| {
+        for i in 0..nt {
+            let (g, off) = (&g, &off);
+            sc.spawn(move || {
+                for x in order.len() * i / nt..order.len() * (i + 1) / nt {
+                    let u = order[x] as usize;
+                    for (j, &[v, w]) in g.adj[g.off[u] as usize..g.off[u + 1] as usize].iter().enumerate() {
+                        unsafe { *out.at(off[x] as usize + j) = [rank[v as usize], w] };
+                    }
+                }
+            });
+        }
+    });
+    Graph { off, adj }
 }
 
 // Distances of one search, in a small open-addressing table so a search costs what it touches.
@@ -252,12 +279,53 @@ fn main() {
     });
     drop((outs, ins));
 
-    // 3. Answer the queries on every core, each thread taking the next unanswered one.
+    // 3. Renumber nodes so a search walks nearby memory: every thread grows breadth-first regions
+    //    from seeds in its own id range, claiming nodes with an atomic flag, and the threads'
+    //    visiting orders, one after another, are the new numbering.
+    let claimed: Vec<AtomicBool> = (0..n).map(|_| AtomicBool::new(false)).collect();
+    let orders: Vec<Vec<u32>> = thread::scope(|sc| {
+        let hs: Vec<_> = (0..nt).map(|i| {
+            let (fwd, claimed) = (&fwd, &claimed);
+            sc.spawn(move || {
+                let mut order = Vec::new();
+                for root in n * i / nt..n * (i + 1) / nt {
+                    if claimed[root].swap(true, Relaxed) {
+                        continue;
+                    }
+                    let mut h = order.len();
+                    order.push(root as u32);
+                    while h < order.len() {
+                        let u = order[h] as usize;
+                        h += 1;
+                        for &[v, _] in &fwd.adj[fwd.off[u] as usize..fwd.off[u + 1] as usize] {
+                            if !claimed[v as usize].load(Relaxed) && !claimed[v as usize].swap(true, Relaxed) {
+                                order.push(v);
+                            }
+                        }
+                    }
+                }
+                order
+            })
+        }).collect();
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    drop(claimed);
+    let order = orders.concat();
+    drop(orders);
+    let mut rank = vec![0u32; n];
+    for (x, &u) in order.iter().enumerate() {
+        rank[u as usize] = x as u32;
+    }
+    let fwd = renumber(fwd, &order, &rank, nt);
+    let bwd = renumber(bwd, &order, &rank, nt);
+    drop(order);
+
+    // 4. Answer the queries on every core, each thread taking the next unanswered one.
     let q = std::fs::read(format!("{data_dir}/queries.txt")).unwrap();
     let mut pairs = Vec::new();
     let mut p = 0;
     while p < q.len() {
-        pairs.push((num(&q, &mut p) as u32, num(&q, &mut p) as u32));
+        pairs.push((rank[num(&q, &mut p) as usize], rank[num(&q, &mut p) as usize]));
     }
     let next = AtomicUsize::new(0);
     let answers: Vec<Vec<(usize, u64)>> = thread::scope(|sc| {

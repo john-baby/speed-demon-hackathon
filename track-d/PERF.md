@@ -7,6 +7,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 0 | The reference, unchanged | | 72.69 | | 0 |
 | 1 | Rust rewrite: mmap, two parallel parsing passes (count degrees with atomics, then place edges) into forward and reverse compressed adjacency arrays, bidirectional Dijkstra with hash-table distances, queries spread over all cores | run-9439da7f8c89 | 1.431 | 461.9 | 39.0 |
 | 2 | Alternate the two searches by smaller queue instead of smaller key: an island source's forward search keeps near-2^32 spur nodes queued, so the key rule let the backward search flood the whole 1.74M-node main body before the island ran dry | run-2e262b3e7e3a | 0.446 | 132.9 | 57.1 |
+| 3 | Renumber nodes for locality, in parallel: each thread grows breadth-first regions from seeds in its own id range, claiming nodes with an atomic flag; the threads' visiting orders, concatenated, are the new ids, and both graphs are rebuilt in parallel in that order | | | | |
 
 ## Notes
 
@@ -15,3 +16,4 @@ Every step from the reference to your final version, each with the live-board ru
 - Tried and parked: renumbering nodes in BFS order halved query time on the laptop (650 ms to 350 ms) but the single-threaded BFS (300 ms over both directions, 180 ms over forward edges only) and the rebuild of both graphs (140 ms) cost as much as it saved.
 - Tried and dropped: one hash table holding both directions' distances (one probe per relaxation instead of three). Query time did not move (650 ms), so the probes are not the bottleneck; the random reads into the 80 MB graph are.
 - Step 2 on the board: T 1.43 s to 0.446 s and M 462 MB to 133 MB, confirming the island queries were the outlier.
+- Step 3 on the laptop: the parallel ordering takes 50 ms instead of 180-300 ms single-threaded, the rebuild 130-160 ms, and queries drop from 650 ms to about 330 ms; the whole run goes from 1.1 s to 0.85-0.95 s.
