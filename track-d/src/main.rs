@@ -59,6 +59,15 @@ impl<T> Shared<T> {
     }
 }
 
+// Ask for the cache line holding r, without waiting for it.
+fn prefetch<T>(r: &T) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        use std::arch::x86_64::*;
+        _mm_prefetch(r as *const T as *const i8, _MM_HINT_T0);
+    }
+}
+
 // Compressed adjacency: the edges of node u are adj[off[u]..off[u + 1]], each [other end, weight].
 struct Graph {
     off: Vec<u32>,
@@ -92,6 +101,9 @@ fn renumber(g: Graph, orders: &[Vec<u32>], ins: &[AtomicU32]) -> (Graph, Vec<u32
             sc.spawn(move || {
                 let mut total = 0;
                 for (j, &u) in order.iter().enumerate() {
+                    if let Some(&f) = order.get(j + 16) {
+                        prefetch(&g.off[f as usize]);
+                    }
                     unsafe {
                         *fo.at(b + j) = total;
                         *ro.at(u as usize) = (b + j) as u32;
@@ -112,7 +124,21 @@ fn renumber(g: Graph, orders: &[Vec<u32>], ins: &[AtomicU32]) -> (Graph, Vec<u32
         for ((order, &b), &e) in orders.iter().zip(&base).zip(&ebase) {
             let (g, rank) = (&g, &rank);
             sc.spawn(move || {
+                // Every read here is random, so ask for each one ahead: offsets 16 nodes ahead,
+                // edges 8 ahead, and the ranks of the heads 4 ahead.
+                let edges = |u: u32| &g.adj[g.off[u as usize] as usize..g.off[u as usize + 1] as usize];
                 for (j, &u) in order.iter().enumerate() {
+                    if let Some(&f) = order.get(j + 16) {
+                        prefetch(&g.off[f as usize]);
+                    }
+                    if let Some(e) = order.get(j + 8).and_then(|&f| edges(f).first()) {
+                        prefetch(e);
+                    }
+                    if let Some(&f) = order.get(j + 4) {
+                        for &[v, _] in edges(f) {
+                            prefetch(&rank[v as usize]);
+                        }
+                    }
                     let at = unsafe { &mut *fo.at(b + j) };
                     *at += e;
                     let u = u as usize;
@@ -330,8 +356,6 @@ fn query<'g, K: Key>(f: &mut Side<'g, K>, b: &mut Side<'g, K>, s: u32, t: u32) -
 }
 
 fn main() {
-    let t0 = std::time::Instant::now();
-    let mut marks = String::new();
     let args: Vec<String> = std::env::args().collect();
     let data_dir = args.get(1).map_or("/data", |s| s.as_str());
     let out_dir = args.get(2).map_or("/out", |s| s.as_str());
@@ -353,20 +377,22 @@ fn main() {
     bounds.push(body.len());
     let chunks: Vec<&[u8]> = (0..nt).map(|i| &body[bounds[i]..bounds[i + 1]]).collect();
 
-    // 1. Parse each chunk once, sending every edge to the thread that owns its tail: thread t owns
-    //    nodes lo(t)..lo(t + 1).
-    let lo = |t: usize| (n * t).div_ceil(nt);
-    let owner = |u: usize| u * nt / n;
+    // 1. Parse each chunk once, sending every edge to the bucket of its tail's part: part p holds
+    //    nodes lo(p)..lo(p + 1), and thread t owns SUB consecutive parts, small enough that placing a
+    //    part's edges writes into a region that fits in cache.
+    const SUB: usize = 8;
+    let parts = nt * SUB;
+    let lo = |p: usize| (n * p).div_ceil(parts);
+    let part = |u: usize| u * parts / n;
     let buckets: Vec<Vec<Vec<[u32; 3]>>> = thread::scope(|sc| {
         let hs: Vec<_> = chunks.iter().map(|c| sc.spawn(move || {
-            let mut out: Vec<Vec<[u32; 3]>> = (0..nt).map(|_| Vec::with_capacity(c.len() / 18 / nt + 64)).collect();
-            each_edge(c, |u, v, w| out[owner(u)].push([u as u32, v as u32, w]));
+            let mut out: Vec<Vec<[u32; 3]>> = (0..parts).map(|_| Vec::with_capacity(c.len() / 18 / parts + 64)).collect();
+            each_edge(c, |u, v, w| out[part(u)].push([u as u32, v as u32, w]));
             out
         })).collect();
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
 
-    marks += &format!("_0x{}", t0.elapsed().as_micros());
     // 2. Each owner counts its nodes' out-degrees and places their edges in the forward graph; only
     //    the start of each owner's range in adj needs the others' totals.
     let mut off = vec![0u32; n + 1];
@@ -375,9 +401,9 @@ fn main() {
         let hs: Vec<_> = (0..nt).map(|t| {
             let buckets = &buckets;
             sc.spawn(move || {
-                let (a, b) = (lo(t), lo(t + 1));
+                let (a, b) = (lo(t * SUB), lo((t + 1) * SUB));
                 let off = unsafe { std::slice::from_raw_parts_mut(fo.at(a), b - a) };
-                for e in buckets.iter().flat_map(|out| &out[t]) {
+                for e in (t * SUB..(t + 1) * SUB).flat_map(|p| buckets.iter().flat_map(move |out| &out[p])) {
                     off[e[0] as usize - a] += 1;
                 }
                 let mut total = 0;
@@ -398,10 +424,10 @@ fn main() {
         for t in 0..nt {
             let (buckets, base) = (&buckets, base[t]);
             sc.spawn(move || {
-                let (a, b) = (lo(t), lo(t + 1));
+                let (a, b) = (lo(t * SUB), lo((t + 1) * SUB));
                 let off = unsafe { std::slice::from_raw_parts_mut(fo.at(a), b - a) };
                 let mut next: Vec<u32> = off.to_vec();
-                for e in buckets.iter().flat_map(|out| &out[t]) {
+                for e in (t * SUB..(t + 1) * SUB).flat_map(|p| buckets.iter().flat_map(move |out| &out[p])) {
                     let x = &mut next[e[0] as usize - a];
                     unsafe { *fa.at((base + *x) as usize) = [e[1], e[2]] };
                     *x += 1;
@@ -415,7 +441,6 @@ fn main() {
     drop(buckets);
     let fwd = Graph { off, adj };
 
-    marks += &format!("_1x{}", t0.elapsed().as_micros());
     // 3. Renumber nodes so a search walks nearby memory: every thread grows breadth-first regions
     //    from seeds in its own id range, claiming nodes with an atomic flag, and the threads'
     //    visiting orders, one after another, are the new numbering.
@@ -432,6 +457,12 @@ fn main() {
                     let mut h = order.len();
                     order.push(root as u32);
                     while h < order.len() {
+                        if let Some(&f) = order.get(h + 8) {
+                            prefetch(&fwd.off[f as usize]);
+                        }
+                        if let Some(e) = order.get(h + 4).and_then(|&f| fwd.adj.get(fwd.off[f as usize] as usize)) {
+                            prefetch(e);
+                        }
                         let u = order[h] as usize;
                         h += 1;
                         for &[v, _] in &fwd.adj[fwd.off[u] as usize..fwd.off[u + 1] as usize] {
@@ -447,15 +478,12 @@ fn main() {
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
     drop(claimed);
-    marks += &format!("_2x{}", t0.elapsed().as_micros());
     let ins: Vec<AtomicU32> = (0..=n).map(|_| AtomicU32::new(0)).collect();
     let (fwd, rank) = renumber(fwd, &orders, &ins);
     drop(orders);
-    marks += &format!("_3x{}", t0.elapsed().as_micros());
     let bwd = transpose(&fwd, &ins, nt);
     drop(ins);
 
-    marks += &format!("_4x{}", t0.elapsed().as_micros());
     // 4. Answer the queries on every core, each thread taking the next unanswered one.
     let q = std::fs::read(format!("{data_dir}/queries.txt")).unwrap();
     let mut pairs = Vec::new();
@@ -488,7 +516,6 @@ fn main() {
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
 
-    marks += &format!("_5x{}", t0.elapsed().as_micros());
     let mut dist = vec![0; pairs.len()];
     for (i, a) in answers.into_iter().flatten() {
         dist[i] = a;
@@ -502,6 +529,4 @@ fn main() {
         }
     }
     std::fs::write(format!("{out_dir}/distances.txt"), o).unwrap();
-    marks += &format!("_ex{}", t0.elapsed().as_micros());
-    std::fs::write(format!("{out_dir}/PROFD{marks}"), b"").unwrap();
 }
