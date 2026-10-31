@@ -413,13 +413,7 @@ fn query<'g, K: Key>(f: &mut Side<'g, K>, b: &mut Side<'g, K>, s: u32, t: u32) -
     }
 }
 
-static QT0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-static QMIN: AtomicUsize = AtomicUsize::new(usize::MAX);
-static QMAX: AtomicUsize = AtomicUsize::new(0);
-static QLONG: AtomicUsize = AtomicUsize::new(0);
 fn main() {
-    let t0 = std::time::Instant::now();
-    let mut marks = String::new();
     let args: Vec<String> = std::env::args().collect();
     let data_dir = args.get(1).map_or("/data", |s| s.as_str());
     let out_dir = args.get(2).map_or("/out", |s| s.as_str());
@@ -457,7 +451,6 @@ fn main() {
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
 
-    marks += &format!("_0x{}", t0.elapsed().as_micros());
     // 2. Each owner counts its nodes' out-degrees and places their edges in the forward graph; only
     //    the start of each owner's range in adj needs the others' totals.
     let mut off = vec![0u32; n + 1];
@@ -506,14 +499,11 @@ fn main() {
     drop(buckets);
     let fwd = Graph { off, adj };
 
-    marks += &format!("_1x{}", t0.elapsed().as_micros());
     // 3. Renumber nodes for locality, then derive the reverse graph.
     let (fwd, ins, rank) = renumber(fwd, nt);
-    marks += &format!("_2x{}", t0.elapsed().as_micros());
     let bwd = transpose(&fwd, &ins, nt);
     drop(ins);
 
-    marks += &format!("_3x{}", t0.elapsed().as_micros());
     // 4. Answer the queries on every core, each thread taking the next unanswered one.
     let q = std::fs::read(format!("{data_dir}/queries.txt")).unwrap();
     let mut pairs = Vec::new();
@@ -523,7 +513,6 @@ fn main() {
     }
     drop(rank);
     let narrow = n <= 1 << 21; // node ids fit u64 heap keys
-    QT0.set(std::time::Instant::now()).unwrap();
     let next = AtomicUsize::new(0);
     let answers: Vec<Vec<(usize, u64)>> = thread::scope(|sc| {
         let hs: Vec<_> = (0..nt).map(|_| {
@@ -534,19 +523,12 @@ fn main() {
                 let mut done = Vec::new();
                 loop {
                     let i = next.fetch_add(1, Relaxed);
-                    let Some(&(s, t)) = pairs.get(i) else {
-                        let e = QT0.get().unwrap().elapsed().as_micros() as usize;
-                        QMIN.fetch_min(e, Relaxed);
-                        QMAX.fetch_max(e, Relaxed);
-                        return done;
-                    };
-                    let q0 = std::time::Instant::now();
+                    let Some(&(s, t)) = pairs.get(i) else { return done };
                     let d = narrow.then(|| query(&mut f, &mut b, s, t)).flatten().unwrap_or_else(|| {
                         let wf = wf.get_or_insert_with(|| Side::<(u64, u32)>::new(fwd));
                         let wb = wb.get_or_insert_with(|| Side::<(u64, u32)>::new(bwd));
                         query(wf, wb, s, t).unwrap()
                     });
-                    QLONG.fetch_max(q0.elapsed().as_micros() as usize, Relaxed);
                     done.push((i, d));
                 }
             })
@@ -554,7 +536,6 @@ fn main() {
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
 
-    marks += &format!("_4x{}", t0.elapsed().as_micros());
     let mut dist = vec![0; pairs.len()];
     for (i, a) in answers.into_iter().flatten() {
         dist[i] = a;
@@ -568,6 +549,4 @@ fn main() {
         }
     }
     std::fs::write(format!("{out_dir}/distances.txt"), o).unwrap();
-    marks += &format!("_ex{}_qfirstdone{}_qlastdone{}_longest{}_nt{}", t0.elapsed().as_micros(), QMIN.load(Relaxed), QMAX.load(Relaxed), QLONG.load(Relaxed), nt);
-    std::fs::write(format!("{out_dir}/PROFD{marks}"), b"").unwrap();
 }
