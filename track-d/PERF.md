@@ -17,6 +17,8 @@ Every step from the reference to your final version, each with the live-board ru
 | 10 | Parse `graph.txt` once instead of twice: each thread sends every edge to a bucket for the thread that owns its tail's id range, then each owner counts and places its own nodes' edges with plain writes into a range that fits its cache, instead of atomic counters and writes spread over the whole graph | run-dd0f5eb4efca | 0.236 | 165.7 | 61.8 |
 | 11 | Distances stored as u32 in the common search (u64 only in the fallback search, now taken at 2^32 - 1), halving the pages a search touches | run-a9c3305e1585 | 0.227 | 136.9 | 62.9 |
 | 12 | In-degrees for the transpose counted while renumbering (the renamed head is already in hand), so the transpose makes one pass instead of two; the rank table and the renumbered offsets built in parallel, each thread over its own BFS order, instead of two serial loops over 1.74M nodes | run-eafebba5e167 | 0.216 | 131.2 | 63.4 |
+| 13 | Each owner's id range split into 8 parts, bucketed separately while parsing, so placing a part's edges writes into a region of about 400 KB that stays in cache instead of scattering over the owner's 3 MB; software prefetches in renumbering (offsets 16 nodes ahead, edges 8 ahead, heads' ranks 4 ahead) and in the BFS | run-e2488bd14f73 | 0.197 | 131.8 | 64.1 |
+| 14 | Graph numbers parsed without a loop per digit: separators are the bytes without bit 4 set, so one 8-byte load gives a number's length, and its digits are combined in pairs with three multiplies | run-94686787028e | 0.188 | 131.7 | 64.6 |
 
 ## Notes
 
@@ -40,3 +42,6 @@ Every step from the reference to your final version, each with the live-board ru
 - Step 10 on the laptop: parse and forward build 205 ms to 145 ms.
 - Page size: with 1,024-id pages a search uses at most 259 pages (2 MB) and 50 on average; 256-id pages made no difference to time or peak memory.
 - Step 11 on the laptop: queries 189 ms to 160 ms; on the board M fell 166 MB to 137 MB.
+- Board profile of step 12 (run-62e9ad7684ff, instrumented, fails the output check on purpose): parse into buckets 24.0 ms, owners place edges 23.6 ms, BFS ordering 19.9 ms, renumbering 27.8 ms, transpose 12.3 ms, queries 94.3 ms. The queries settle 9.57M nodes with 10.4M heap pushes and only 0.18M stale pops on the synthetic graph, so the search itself wastes little; the build had more to give.
+- Before step 13, one thread on the laptop: parse 125 ms, count 40 ms, place 145 ms, BFS 160 ms, renumber 265 ms, transpose 60 ms; placing and renumbering are random-access bound. With 8 threads, step 13 took placing from about 56 ms to 18 ms, renumbering from 83 ms to 65 ms and the BFS from 40 ms to 34 ms.
+- Step 14 on the laptop: the parse took a third less time on one thread.
