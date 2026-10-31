@@ -190,7 +190,9 @@ fn query(f: &mut Side, b: &mut Side, s: u32, t: u32) -> u64 {
         if tf.saturating_add(tb) >= best {
             return best;
         }
-        if tf <= tb {
+        // Grow the smaller frontier: a side that is about to run dry (an island, a dead end)
+        // finishes first instead of letting the other side flood the graph.
+        if f.heap.len() <= b.heap.len() {
             f.step(b, &mut best);
         } else {
             b.step(f, &mut best);
