@@ -19,6 +19,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 12 | In-degrees for the transpose counted while renumbering (the renamed head is already in hand), so the transpose makes one pass instead of two; the rank table and the renumbered offsets built in parallel, each thread over its own BFS order, instead of two serial loops over 1.74M nodes | run-eafebba5e167 | 0.216 | 131.2 | 63.4 |
 | 13 | Each owner's id range split into 8 parts, bucketed separately while parsing, so placing a part's edges writes into a region of about 400 KB that stays in cache instead of scattering over the owner's 3 MB; software prefetches in renumbering (offsets 16 nodes ahead, edges 8 ahead, heads' ranks 4 ahead) and in the BFS | run-e2488bd14f73 | 0.197 | 131.8 | 64.1 |
 | 14 | Graph numbers parsed without a loop per digit: separators are the bytes without bit 4 set, so one 8-byte load gives a number's length, and its digits are combined in pairs with three multiplies | run-94686787028e | 0.188 | 131.7 | 64.6 |
+| 15 | Prefetch the offsets and first edge of the node left on top of the heap after each pop: it is usually the next node settled, so its edges arrive while the current node's are relaxed | run-6c71bd9bd5ba | 0.179 | 131.1 | 65.1 |
 
 ## Notes
 
@@ -45,3 +46,4 @@ Every step from the reference to your final version, each with the live-board ru
 - Board profile of step 12 (run-62e9ad7684ff, instrumented, fails the output check on purpose): parse into buckets 24.0 ms, owners place edges 23.6 ms, BFS ordering 19.9 ms, renumbering 27.8 ms, transpose 12.3 ms, queries 94.3 ms. The queries settle 9.57M nodes with 10.4M heap pushes and only 0.18M stale pops on the synthetic graph, so the search itself wastes little; the build had more to give.
 - Before step 13, one thread on the laptop: parse 125 ms, count 40 ms, place 145 ms, BFS 160 ms, renumber 265 ms, transpose 60 ms; placing and renumbering are random-access bound. With 8 threads, step 13 took placing from about 56 ms to 18 ms, renumbering from 83 ms to 65 ms and the BFS from 40 ms to 34 ms.
 - Step 14 on the laptop: the parse took a third less time on one thread.
+- Step 15 on the laptop: queries about 180 ms to 140 ms. Also prefetching the root's two children (one of which is usually the top after the next pop) made no further difference, so only the top is prefetched.
