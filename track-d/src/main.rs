@@ -77,38 +77,61 @@ fn offsets(count: &[AtomicU32]) -> Vec<u32> {
     off
 }
 
-// The same graph with node order[x] renamed x (rank is the inverse); threads fill disjoint ranges.
-fn renumber(g: Graph, order: &[u32], rank: &[u32], nt: usize) -> Graph {
-    let mut off = Vec::with_capacity(order.len() + 1);
-    let mut total = 0;
-    for &u in order {
-        off.push(total);
-        total += g.off[u as usize + 1] - g.off[u as usize];
-    }
-    off.push(total);
-    let mut adj = vec![[0u32; 2]; total as usize];
+// The same graph with its nodes renamed in the order the threads' orders list them, one after
+// another, each thread handling its own order: first the new offsets and rank (old id to new id),
+// then the edges, renamed. Also counts the renamed graph's in-degrees into ins, for the transpose.
+fn renumber(g: Graph, orders: &[Vec<u32>], ins: &[AtomicU32]) -> (Graph, Vec<u32>) {
+    let n = g.off.len() - 1;
+    let base: Vec<usize> = orders.iter().scan(0, |acc, o| { let b = *acc; *acc += o.len(); Some(b) }).collect();
+    let mut off = vec![0u32; n + 1];
+    let mut rank = vec![0u32; n];
+    let (fo, ro) = (Shared(off.as_mut_ptr()), Shared(rank.as_mut_ptr()));
+    let totals: Vec<u32> = thread::scope(|sc| {
+        let hs: Vec<_> = orders.iter().zip(&base).map(|(order, &b)| {
+            let g = &g;
+            sc.spawn(move || {
+                let mut total = 0;
+                for (j, &u) in order.iter().enumerate() {
+                    unsafe {
+                        *fo.at(b + j) = total;
+                        *ro.at(u as usize) = (b + j) as u32;
+                    }
+                    total += g.off[u as usize + 1] - g.off[u as usize];
+                }
+                total
+            })
+        }).collect();
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    let ebase: Vec<u32> = totals.iter().scan(0, |acc, &t| { let b = *acc; *acc += t; Some(b) }).collect();
+    let m = totals.iter().sum::<u32>();
+    off[n] = m;
+    let mut adj = vec![[0u32; 2]; m as usize];
     let out = Shared(adj.as_mut_ptr());
     thread::scope(|sc| {
-        for i in 0..nt {
-            let (g, off) = (&g, &off);
+        for ((order, &b), &e) in orders.iter().zip(&base).zip(&ebase) {
+            let (g, rank) = (&g, &rank);
             sc.spawn(move || {
-                for x in order.len() * i / nt..order.len() * (i + 1) / nt {
-                    let u = order[x] as usize;
-                    for (j, &[v, w]) in g.adj[g.off[u] as usize..g.off[u + 1] as usize].iter().enumerate() {
-                        unsafe { *out.at(off[x] as usize + j) = [rank[v as usize], w] };
+                for (j, &u) in order.iter().enumerate() {
+                    let at = unsafe { &mut *fo.at(b + j) };
+                    *at += e;
+                    let u = u as usize;
+                    for (k, &[v, w]) in g.adj[g.off[u] as usize..g.off[u + 1] as usize].iter().enumerate() {
+                        let y = rank[v as usize];
+                        ins[y as usize].fetch_add(1, Relaxed);
+                        unsafe { *out.at(*at as usize + k) = [y, w] };
                     }
                 }
             });
         }
     });
-    Graph { off, adj }
+    (Graph { off, adj }, rank)
 }
 
-// The reverse graph of g: count in-degrees, then place every edge u -> v as v <- u. Once nodes are
+// The reverse graph of g, given its in-degrees: place every edge u -> v as v <- u. Once nodes are
 // renumbered for locality, u and v are mostly close, so the counters and the writes stay local.
-fn transpose(g: &Graph, nt: usize) -> Graph {
+fn transpose(g: &Graph, ins: &[AtomicU32], nt: usize) -> Graph {
     let n = g.off.len() - 1;
-    let ins: Vec<AtomicU32> = (0..=n).map(|_| AtomicU32::new(0)).collect();
     let each = |f: &(dyn Fn(usize, u32, u32) + Sync)| thread::scope(|sc| {
         for i in 0..nt {
             sc.spawn(move || {
@@ -120,10 +143,7 @@ fn transpose(g: &Graph, nt: usize) -> Graph {
             });
         }
     });
-    each(&|_, v, _| {
-        ins[v as usize].fetch_add(1, Relaxed);
-    });
-    let off = offsets(&ins);
+    let off = offsets(ins);
     let mut adj = vec![[0u32; 2]; g.adj.len()];
     let out = Shared(adj.as_mut_ptr());
     each(&|u, v, w| unsafe { *out.at(ins[v as usize].fetch_add(1, Relaxed) as usize) = [u as u32, w] });
@@ -423,15 +443,11 @@ fn main() {
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
     drop(claimed);
-    let order = orders.concat();
+    let ins: Vec<AtomicU32> = (0..=n).map(|_| AtomicU32::new(0)).collect();
+    let (fwd, rank) = renumber(fwd, &orders, &ins);
     drop(orders);
-    let mut rank = vec![0u32; n];
-    for (x, &u) in order.iter().enumerate() {
-        rank[u as usize] = x as u32;
-    }
-    let fwd = renumber(fwd, &order, &rank, nt);
-    drop(order);
-    let bwd = transpose(&fwd, nt);
+    let bwd = transpose(&fwd, &ins, nt);
+    drop(ins);
 
     // 4. Answer the queries on every core, each thread taking the next unanswered one.
     let q = std::fs::read(format!("{data_dir}/queries.txt")).unwrap();
