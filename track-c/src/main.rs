@@ -1,6 +1,6 @@
 // Speed Demon 2026, Track C (Join). See README.md for the approach.
 use std::io::Write;
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicU64, Ordering::{Acquire, Relaxed, Release}};
 use std::thread;
 
 // Map the input read-only; the host has it in the page cache, so it is not charged to us.
@@ -74,18 +74,6 @@ fn text<'a>(d: &'a [u8], p: &mut usize) -> (&'a [u8], usize) {
     (&d[s + 1..i], escapes)
 }
 
-fn word(d: &[u8], i: usize) -> u64 {
-    u64::from_le_bytes(d[i..i + 8].try_into().unwrap())
-}
-
-// Names are short: hash the length and the first and last 8 bytes. A record always follows a name,
-// so the 8-byte read at s is in bounds.
-fn hash(d: &[u8], s: usize, len: usize) -> u64 {
-    let (head, tail) = if len >= 8 { (word(d, s), word(d, s + len - 8)) } else { (word(d, s) & ((1u64 << (8 * len)) - 1), 0) };
-    let h = (head ^ tail.rotate_left(29) ^ len as u64).wrapping_mul(0x517c_c1b7_2722_0a95);
-    h ^ h >> 32
-}
-
 #[derive(Clone, Copy)]
 struct Agg {
     count: i64,
@@ -97,42 +85,61 @@ struct Agg {
     note_bytes: i64,
 }
 
-// Distinct names across all threads: a lock-free open-addressing table. A slot holds a name's file
-// offset, length and hash tag in one word (claimed by compare-and-swap); the name's bitmask of the
-// groups it occurs in sits at the same index in `masks`.
-struct Names {
-    slots: Vec<AtomicU64>,
-    masks: Vec<AtomicU64>,
-    words: usize,
+// Distinct names across all threads: a lock-free open-addressing table of one-cache-line slots.
+// A slot holds the name's file offset and length (claimed by compare-and-swap), its first 24 bytes,
+// and its bitmask of the groups it occurs in, so a lookup touches one line, not three.
+#[repr(C, align(64))]
+struct Slot {
+    entry: AtomicU64, // offset << 32 | len + 1; 0 = empty, BUSY = being filled
+    key: [AtomicU64; 3],
+    mask: [AtomicU64; 4],
 }
 
-const NAME_BITS: u32 = 18; // the generator draws names from a pool of 100,000
+const NAME_BITS: u32 = 17; // the generator draws names from a pool of 100,000
+const BUSY: u64 = 1;
+
+struct Names {
+    slots: Vec<Slot>,
+}
 
 impl Names {
     fn add(&self, d: &[u8], s: usize, len: usize, g: usize) {
-        let h = hash(d, s, len);
-        let entry = (s as u64) << 32 | (len as u64) << 16 | h & 0xffff;
-        let same = |e: u64| e & 0xffff_ffff == entry & 0xffff_ffff && {
-            let o = (e >> 32) as usize;
-            d[o..o + len] == d[s..s + len]
-        };
-        let mask = self.slots.len() - 1;
+        let mut b = [0u8; 24];
+        b[..len.min(24)].copy_from_slice(&d[s..s + len.min(24)]);
+        let key: [u64; 3] = std::array::from_fn(|i| u64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().unwrap()));
+        let entry = (s as u64) << 32 | (len as u64 + 1);
+        let h = (key[0] ^ key[1].rotate_left(21) ^ key[2].rotate_left(42) ^ len as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
         let mut i = (h >> (64 - NAME_BITS)) as usize;
         loop {
-            let cur = self.slots[i].load(Relaxed);
-            let found = if cur == 0 {
-                match self.slots[i].compare_exchange(0, entry, Relaxed, Relaxed) {
-                    Ok(_) => true,
-                    Err(now) => same(now),
+            let slot = &self.slots[i];
+            let mut e = slot.entry.load(Acquire);
+            if e == 0 {
+                match slot.entry.compare_exchange(0, BUSY, Acquire, Acquire) {
+                    Ok(_) => {
+                        for (k, &w) in slot.key.iter().zip(&key) {
+                            k.store(w, Relaxed);
+                        }
+                        slot.entry.store(entry, Release);
+                        e = entry;
+                    }
+                    Err(now) => e = now,
                 }
-            } else {
-                same(cur)
-            };
-            if found {
-                self.masks[i * self.words + g / 64].fetch_or(1 << (g % 64), Relaxed);
+            }
+            while e == BUSY {
+                e = slot.entry.load(Acquire);
+            }
+            let o = (e >> 32) as usize;
+            if e & 0xffff_ffff == len as u64 + 1
+                && slot.key.iter().zip(&key).all(|(k, &w)| k.load(Relaxed) == w)
+                && (len <= 24 || d[o + 24..o + len] == d[s + 24..s + len])
+            {
+                let m = &slot.mask[g / 64];
+                if m.load(Relaxed) >> (g % 64) & 1 == 0 {
+                    m.fetch_or(1 << (g % 64), Relaxed);
+                }
                 return;
             }
-            i = (i + 1) & mask;
+            i = (i + 1) & ((1 << NAME_BITS) - 1);
         }
     }
 }
@@ -237,11 +244,9 @@ fn main() {
 
     // 3. Parse and aggregate every chunk in parallel, all threads sharing one name table.
     let groups = unmatched + 1;
-    let words = groups.div_ceil(64);
+    assert!(groups <= 256, "group masks hold 256 groups");
     let names = Names {
-        slots: (0..1 << NAME_BITS).map(|_| AtomicU64::new(0)).collect(),
-        masks: (0..words << NAME_BITS).map(|_| AtomicU64::new(0)).collect(),
-        words,
+        slots: (0..1 << NAME_BITS).map(|_| Slot { entry: AtomicU64::new(0), key: Default::default(), mask: Default::default() }).collect(),
     };
     let parts: Vec<Vec<Agg>> = thread::scope(|sc| {
         let hs: Vec<_> = (0..nt).map(|i| {
@@ -253,8 +258,8 @@ fn main() {
 
     // 4. Each group's distinct names are the masks with its bit set.
     let mut distinct = vec![0i64; groups];
-    for m in names.masks.chunks(words) {
-        for (w, word) in m.iter().enumerate() {
+    for slot in &names.slots {
+        for (w, word) in slot.mask.iter().enumerate() {
             let mut bits = word.load(Relaxed);
             while bits != 0 {
                 distinct[w * 64 + bits.trailing_zeros() as usize] += 1;
