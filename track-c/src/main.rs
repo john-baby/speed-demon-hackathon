@@ -118,14 +118,32 @@ struct Names {
     slots: Vec<Slot>,
 }
 
+// A name's key and home slot, computed one record ahead so its cache line can be prefetched.
+struct Lookup {
+    s: usize,
+    len: usize,
+    key: [u64; 3],
+    i: usize,
+}
+
 impl Names {
-    fn add(&self, d: &[u8], s: usize, len: usize, g: usize) {
+    fn lookup(&self, d: &[u8], s: usize, len: usize) -> Lookup {
         let mut b = [0u8; 24];
         b[..len.min(24)].copy_from_slice(&d[s..s + len.min(24)]);
         let key: [u64; 3] = std::array::from_fn(|i| u64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().unwrap()));
-        let entry = (s as u64) << 32 | (len as u64 + 1);
         let h = (key[0] ^ key[1].rotate_left(21) ^ key[2].rotate_left(42) ^ len as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
-        let mut i = (h >> (64 - NAME_BITS)) as usize;
+        let i = (h >> (64 - NAME_BITS)) as usize;
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            use std::arch::x86_64::*;
+            _mm_prefetch(&self.slots[i] as *const Slot as *const i8, _MM_HINT_T0);
+        }
+        Lookup { s, len, key, i }
+    }
+
+    fn add(&self, d: &[u8], l: &Lookup, g: usize) {
+        let Lookup { s, len, key, mut i } = *l;
+        let entry = (s as u64) << 32 | (len as u64 + 1);
         loop {
             let slot = &self.slots[i];
             let mut e = slot.entry.load(Acquire);
@@ -165,6 +183,7 @@ impl Names {
 fn parse(d: &[u8], start: usize, end: usize, code_of: &[u16], rank: &[u16], unmatched: usize, names: &Names) -> Vec<Agg> {
     let empty = Agg { count: 0, id_sum: 0, amount_sum: 0, min: i64::MAX, max: i64::MIN, name_bytes: 0, note_bytes: 0 };
     let mut aggs = vec![empty; unmatched + 1];
+    let mut pending = None;
     let mut p = start;
     while p < end {
         if d[p..].starts_with(BOM) {
@@ -190,7 +209,14 @@ fn parse(d: &[u8], start: usize, end: usize, code_of: &[u16], rank: &[u16], unma
         a.max = a.max.max(cents);
         a.name_bytes += (name.len() - name_esc) as i64;
         a.note_bytes += (note.len() - note_esc) as i64;
-        names.add(d, name.as_ptr() as usize - d.as_ptr() as usize, name.len(), g);
+        // Record the previous name while this one's slot is on its way into the cache.
+        let l = names.lookup(d, name.as_ptr() as usize - d.as_ptr() as usize, name.len());
+        if let Some((prev, pg)) = pending.replace((l, g)) {
+            names.add(d, &prev, pg);
+        }
+    }
+    if let Some((prev, pg)) = pending {
+        names.add(d, &prev, pg);
     }
     aggs
 }

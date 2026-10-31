@@ -9,6 +9,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 2 | One shared lock-free name table instead of one per thread (a slot packs a name's file offset, length and hash tag into one word, claimed by compare-and-swap; group bits set with an atomic OR); hash names by length and first and last 8 bytes; count quotes with a byte fold the compiler vectorises; rank country codes through a 26^3 array instead of sorting 200,000 slices | run-94332be51efa | 0.090 | 22.2 | 63.5 |
 | 3 | One 64-byte cache line per name slot holding the claimed offset and length, the name's first 24 bytes and its group mask, so a lookup is one cache miss instead of three; names over 24 bytes compare the rest against their first occurrence; 2^17 slots keep the table at 8 MB | run-6ba0d0eeac90 | 0.088 | 21.8 | 63.8 |
 | 4 | No quote-counting pass: by the spec's section 2.2 notes are lowercase words and quotes and names never hold an LF, so an LF followed by a digit or a BOM always ends a record, and each thread finds its first record start directly. `regions.csv` is mapped and parsed in parallel into a region-to-country-code array, with groups looked up through a 26^3 rank table, instead of 200,000 lines on one thread | run-e4f06a156ca2 | 0.081 | 14.9 | 66.0 |
+| 5 | Hide the name table's cache miss: compute each name's key and home slot as soon as it is parsed and prefetch that slot's line, then update the previous record's name, whose line has had a whole record's parsing to arrive | | | | |
 
 ## Notes
 
