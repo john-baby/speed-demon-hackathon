@@ -125,11 +125,11 @@ fn running(c: &[AtomicU32], nt: usize) {
 // Renumber nodes so a search walks nearby memory: every thread grows breadth-first regions from
 // seeds in its own id range, and the threads' visiting orders, one after another, are the new
 // numbering. A thread claims a node by writing its provisional id, thread << bits | its place in
-// that thread's order + 1 (0 is free), with a compare-and-swap, so reading a neighbour's slot gives either nothing
-// (and the reader claims it) or its id. Each thread writes its nodes' edges, renamed provisionally,
-// as it visits them, so the old graph is read once. A last pass turns provisional ids into final
-// ones while copying the edges into place, and counts in-degrees for the transpose. Returns the new
-// graph, its in-degrees and the map from old ids to new.
+// that thread's order + 1 (0 is free), with a compare-and-swap, so reading a neighbour's slot gives
+// either nothing (and the reader claims it) or its id. Each thread writes its nodes' edges, renamed
+// provisionally, as it visits them, so the old graph is read once. A last pass turns provisional
+// ids into final ones while copying the edges into the old graph's memory, and counts in-degrees
+// for the transpose. Returns the new graph, its in-degrees and the map from old ids to new.
 fn renumber(g: Graph, nt: usize) -> (Graph, Vec<AtomicU32>, impl Fn(usize) -> u32) {
     const FREE: u32 = 0;
     let n = g.off.len() - 1;
@@ -189,16 +189,15 @@ fn renumber(g: Graph, nt: usize) -> (Graph, Vec<AtomicU32>, impl Fn(usize) -> u3
         }).collect();
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
-    drop(g);
     let prefix = |len: &dyn Fn(&(Vec<u32>, Vec<[u32; 2]>)) -> usize| -> Vec<u32> {
         parts.iter().scan(0, |acc, p| { let b = *acc; *acc += len(p) as u32; Some(b) }).collect()
     };
     let (base, ebase) = (prefix(&|p| p.0.len()), prefix(&|p| p.1.len()));
-    let m = parts.iter().map(|p| p.1.len()).sum::<usize>();
     let mask = (1 << bits) - 1;
     let new_id = move |r: u32| base[(r >> bits) as usize] + (r & mask) - 1;
-    let mut off = vec![0u32; n + 1];
-    let mut adj = vec![[0u32; 2]; m];
+    // The old graph has exactly the new one's shape: reuse its memory instead of freeing 47 MB
+    // on one thread and faulting 47 MB of fresh pages back in.
+    let Graph { mut off, mut adj } = g;
     let ins = zeroed(n + 1);
     let (fo, fa) = (Shared(off.as_mut_ptr()), Shared(adj.as_mut_ptr()));
     // Each thread also frees its own part, so the 47 MB are given back in parallel.
@@ -373,22 +372,20 @@ impl<'g, K: Key> Side<'g, K> {
         self.heap.push(Reverse(K::make(0, from).unwrap()));
     }
 
-    // The smallest tentative distance still queued, dropping stale entries; MAX when empty.
-    fn top(&mut self) -> u64 {
-        while let Some(&Reverse(k)) = self.heap.peek() {
-            let (d, u) = k.split();
-            if d == K::load(self.dist.get(u)) {
-                return d;
-            }
-            self.heap.pop();
-        }
-        u64::MAX
+    // The smallest key queued, MAX when empty. A stale entry can only make it lower, which keeps the
+    // stop rule safe, so stale entries (2% of pops) are skipped when popped, not looked up per peek.
+    fn top(&self) -> u64 {
+        self.heap.peek().map_or(u64::MAX, |r| r.0.split().0)
     }
 
-    // Settle the top node and relax its edges; any node the other side has reached closes a path.
+    // Settle the top node, unless it is stale, and relax its edges; any node the other side has
+    // reached closes a path.
     // False when a distance does not fit K.
     fn step(&mut self, other: &Self, best: &mut u64) -> bool {
         let (d, u) = self.heap.pop().unwrap().0.split();
+        if d != K::load(self.dist.get(u)) {
+            return true;
+        }
         let g = self.g;
         // The node now on top is likely the next one settled: start fetching its edges.
         if let Some(&Reverse(k)) = self.heap.peek() {
@@ -404,6 +401,9 @@ impl<'g, K: Key> Side<'g, K> {
                 let Some(k) = K::make(nd, v) else { return false };
                 self.dist.set(v, K::store(nd));
                 self.heap.push(Reverse(k));
+                // v is likely settled later: fetch its offsets now, so that the prefetch of its
+                // edges, once it is on top, does not have to wait for them.
+                prefetch(&g.off[v as usize]);
                 let o = K::load(other.dist.get(v));
                 if o != u64::MAX {
                     *best = (*best).min(nd + o);

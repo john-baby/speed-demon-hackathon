@@ -238,10 +238,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let data_dir = args.get(1).map_or("/data", |s| s.as_str());
     let out_dir = args.get(2).map_or("/out", |s| s.as_str());
-    let t0 = std::time::Instant::now();
-    let us = || t0.elapsed().as_micros();
     let d = load(&format!("{data_dir}/requests.log"));
-    let t_load = us();
     let nt = thread::available_parallelism().map_or(1, |n| n.get());
 
     // 1. Split at line starts and parse every chunk in parallel.
@@ -254,14 +251,13 @@ fn main() {
         bounds.push(x);
     }
     bounds.push(d.len());
-    let (chunks, pt): (Vec<Chunk>, Vec<(u128, u128)>) = thread::scope(|sc| {
+    let chunks: Vec<Chunk> = thread::scope(|sc| {
         let hs: Vec<_> = (0..nt).map(|i| {
             let part = &d[bounds[i]..bounds[i + 1]];
-            sc.spawn(move || { let a = us(); let c = parse(part); (c, (a, us())) })
+            sc.spawn(move || parse(part))
         }).collect();
-        hs.into_iter().map(|h| h.join().unwrap()).unzip()
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
-    let t_parse = us();
 
     // 2. Rank endpoints in byte order, and map each rank to every chunk's own id.
     let mut all = Names::new();
@@ -281,22 +277,21 @@ fn main() {
     }).collect();
     let names: Vec<&[u8]> = order.iter().map(|&i| &all.names[i][..]).collect();
 
-    let t_rank = us();
     // 3. Each thread takes the next hour, merges every group's blocks from all chunks and
     // finds the nearest-rank percentiles by selection. It writes the hour itself once the
     // hour before is written, so each thread holds one hour of output, not a backlog.
     let next = AtomicUsize::new(0);
     let f = std::fs::File::create(format!("{out_dir}/summary.txt")).unwrap();
     let turn = (Mutex::new(0), Condvar::new()); // the next hour to write
-    let st: Vec<u128> = thread::scope(|sc| {
-        let hs: Vec<_> = (0..nt).map(|_| {
+    thread::scope(|sc| {
+        for _ in 0..nt {
             let (chunks, local, names, next, f, turn) = (&chunks, &local, &names, &next, &f, &turn);
             sc.spawn(move || {
                 let (mut v, mut o) = (Vec::new(), Vec::new());
                 loop {
                     let h = next.fetch_add(1, Ordering::Relaxed);
                     if h >= HOURS {
-                        return us();
+                        return;
                     }
                     let label = hour_label(h);
                     o.clear();
@@ -333,19 +328,9 @@ fn main() {
                     *w += 1;
                     turn.1.notify_all();
                 }
-            })
-        }).collect();
-        hs.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+        }
     });
-    let t_sel = us();
-    drop((chunks, local, all, f));
-    let t_end = us();
-    let pd: Vec<u128> = pt.iter().map(|&(a, b)| b - a).collect();
-    // Throwaway profile: phase times in microseconds since start, as an extra file name.
-    std::fs::File::create(format!(
-        "{out_dir}/prof_nt{nt}_load{t_load}_parse{t_parse}_rank{t_rank}_sel{t_sel}_end{t_end}_pstart{}-{}_pdur{}-{}_pend{}-{}_selend{}-{}",
-        pt.iter().map(|x| x.0).min().unwrap(), pt.iter().map(|x| x.0).max().unwrap(),
-        pd.iter().min().unwrap(), pd.iter().max().unwrap(),
-        pt.iter().map(|x| x.1).min().unwrap(), pt.iter().map(|x| x.1).max().unwrap(),
-        st.iter().min().unwrap(), st.iter().max().unwrap())).unwrap();
+    // Everything is written: leave without freeing the arenas and tables one by one.
+    std::process::exit(0);
 }
