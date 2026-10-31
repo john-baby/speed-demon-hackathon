@@ -2,7 +2,7 @@
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering::Relaxed};
 use std::thread;
 
 // Map the input read-only; the host has it in the page cache, so it is not charged to us.
@@ -107,72 +107,101 @@ fn offsets(count: &[AtomicU32]) -> Vec<u32> {
     off
 }
 
-// The same graph with its nodes renamed in the order the threads' orders list them, one after
-// another, each thread handling its own order: first the new offsets and rank (old id to new id),
-// then the edges, renamed. Also counts the renamed graph's in-degrees into ins, for the transpose.
-fn renumber(g: Graph, orders: &[Vec<u32>], ins: &[AtomicU32]) -> (Graph, Vec<u32>) {
+// Renumber nodes so a search walks nearby memory: every thread grows breadth-first regions from
+// seeds in its own id range, and the threads' visiting orders, one after another, are the new
+// numbering. A thread claims a node by writing its provisional id, thread << bits | its place in
+// that thread's order, with a compare-and-swap, so reading a neighbour's slot gives either nothing
+// (and the reader claims it) or its id. Each thread writes its nodes' edges, renamed provisionally,
+// as it visits them, so the old graph is read once. A last pass turns provisional ids into final
+// ones while copying the edges into place, and counts in-degrees for the transpose. Returns the new
+// graph, its in-degrees and the map from old ids to new.
+fn renumber(g: Graph, nt: usize) -> (Graph, Vec<AtomicU32>, impl Fn(usize) -> u32) {
+    const FREE: u32 = u32::MAX;
     let n = g.off.len() - 1;
-    let base: Vec<usize> = orders.iter().scan(0, |acc, o| { let b = *acc; *acc += o.len(); Some(b) }).collect();
-    let mut off = vec![0u32; n + 1];
-    let mut rank = vec![0u32; n];
-    let (fo, ro) = (Shared(off.as_mut_ptr()), Shared(rank.as_mut_ptr()));
-    let totals: Vec<u32> = thread::scope(|sc| {
-        let hs: Vec<_> = orders.iter().zip(&base).map(|(order, &b)| {
-            let g = &g;
+    let bits = usize::BITS - n.leading_zeros();
+    assert!((nt as u64) << bits < 1 << 32, "provisional ids fit u32");
+    let tmp: Vec<AtomicU32> = (0..n).map(|_| AtomicU32::new(FREE)).collect();
+    let parts: Vec<(Vec<u32>, Vec<[u32; 2]>)> = thread::scope(|sc| {
+        let hs: Vec<_> = (0..nt).map(|t| {
+            let (g, tmp) = (&g, &tmp);
             sc.spawn(move || {
-                let mut total = 0;
-                for (j, &u) in order.iter().enumerate() {
-                    if let Some(&f) = order.get(j + 16) {
-                        prefetch(&g.off[f as usize]);
+                let edges_of = |u: u32| &g.adj[g.off[u as usize] as usize..g.off[u as usize + 1] as usize];
+                let room = n / nt + n / nt / 4;
+                let (mut order, mut ends) = (Vec::with_capacity(room), Vec::with_capacity(room));
+                let mut edges: Vec<[u32; 2]> = Vec::with_capacity(g.adj.len() / nt + g.adj.len() / nt / 4);
+                for root in n * t / nt..n * (t + 1) / nt {
+                    let id = (t << bits | order.len()) as u32;
+                    if tmp[root].load(Relaxed) != FREE || tmp[root].compare_exchange(FREE, id, Relaxed, Relaxed).is_err() {
+                        continue;
                     }
-                    unsafe {
-                        *fo.at(b + j) = total;
-                        *ro.at(u as usize) = (b + j) as u32;
+                    let mut h = order.len();
+                    order.push(root as u32);
+                    while h < order.len() {
+                        // Every read here is random, so ask for each one ahead: offsets 8 nodes
+                        // ahead, edges 4 ahead, and the heads' slots 2 ahead.
+                        if let Some(&f) = order.get(h + 8) {
+                            prefetch(&g.off[f as usize]);
+                        }
+                        if let Some(e) = order.get(h + 4).and_then(|&f| edges_of(f).first()) {
+                            prefetch(e);
+                        }
+                        if let Some(&f) = order.get(h + 2) {
+                            for &[v, _] in edges_of(f) {
+                                prefetch(&tmp[v as usize]);
+                            }
+                        }
+                        let u = order[h];
+                        h += 1;
+                        for &[v, w] in edges_of(u) {
+                            let mut r = tmp[v as usize].load(Relaxed);
+                            if r == FREE {
+                                let id = (t << bits | order.len()) as u32;
+                                r = match tmp[v as usize].compare_exchange(FREE, id, Relaxed, Relaxed) {
+                                    Ok(_) => {
+                                        order.push(v);
+                                        id
+                                    }
+                                    Err(now) => now,
+                                };
+                            }
+                            edges.push([r, w]);
+                        }
+                        ends.push(edges.len() as u32);
                     }
-                    total += g.off[u as usize + 1] - g.off[u as usize];
                 }
-                total
+                (ends, edges)
             })
         }).collect();
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
-    let ebase: Vec<u32> = totals.iter().scan(0, |acc, &t| { let b = *acc; *acc += t; Some(b) }).collect();
-    let m = totals.iter().sum::<u32>();
-    off[n] = m;
-    let mut adj = vec![[0u32; 2]; m as usize];
-    let out = Shared(adj.as_mut_ptr());
+    drop(g);
+    let prefix = |len: &dyn Fn(&(Vec<u32>, Vec<[u32; 2]>)) -> usize| -> Vec<u32> {
+        parts.iter().scan(0, |acc, p| { let b = *acc; *acc += len(p) as u32; Some(b) }).collect()
+    };
+    let (base, ebase) = (prefix(&|p| p.0.len()), prefix(&|p| p.1.len()));
+    let m = parts.iter().map(|p| p.1.len()).sum::<usize>();
+    let mask = (1 << bits) - 1;
+    let new_id = move |r: u32| base[(r >> bits) as usize] + (r & mask);
+    let mut off = vec![0u32; n + 1];
+    let mut adj = vec![[0u32; 2]; m];
+    let ins: Vec<AtomicU32> = (0..=n).map(|_| AtomicU32::new(0)).collect();
+    let (fo, fa) = (Shared(off.as_mut_ptr()), Shared(adj.as_mut_ptr()));
     thread::scope(|sc| {
-        for ((order, &b), &e) in orders.iter().zip(&base).zip(&ebase) {
-            let (g, rank) = (&g, &rank);
+        for (t, (ends, edges)) in parts.iter().enumerate() {
+            let (new_id, ins, b, e) = (&new_id, &ins, new_id((t << bits) as u32) as usize, ebase[t]);
             sc.spawn(move || {
-                // Every read here is random, so ask for each one ahead: offsets 16 nodes ahead,
-                // edges 8 ahead, and the ranks of the heads 4 ahead.
-                let edges = |u: u32| &g.adj[g.off[u as usize] as usize..g.off[u as usize + 1] as usize];
-                for (j, &u) in order.iter().enumerate() {
-                    if let Some(&f) = order.get(j + 16) {
-                        prefetch(&g.off[f as usize]);
-                    }
-                    if let Some(e) = order.get(j + 8).and_then(|&f| edges(f).first()) {
-                        prefetch(e);
-                    }
-                    if let Some(&f) = order.get(j + 4) {
-                        for &[v, _] in edges(f) {
-                            prefetch(&rank[v as usize]);
-                        }
-                    }
-                    let at = unsafe { &mut *fo.at(b + j) };
-                    *at += e;
-                    let u = u as usize;
-                    for (k, &[v, w]) in g.adj[g.off[u] as usize..g.off[u + 1] as usize].iter().enumerate() {
-                        let y = rank[v as usize];
-                        ins[y as usize].fetch_add(1, Relaxed);
-                        unsafe { *out.at(*at as usize + k) = [y, w] };
-                    }
+                for (h, &end) in ends.iter().enumerate() {
+                    unsafe { *fo.at(b + h + 1) = e + end };
+                }
+                for (k, &[r, w]) in edges.iter().enumerate() {
+                    let y = new_id(r);
+                    ins[y as usize].fetch_add(1, Relaxed);
+                    unsafe { *fa.at(e as usize + k) = [y, w] };
                 }
             });
         }
     });
-    (Graph { off, adj }, rank)
+    (Graph { off, adj }, ins, move |u: usize| new_id(tmp[u].load(Relaxed)))
 }
 
 // The reverse graph of g, given its in-degrees: place every edge u -> v as v <- u. Once nodes are
@@ -470,46 +499,8 @@ fn main() {
     drop(buckets);
     let fwd = Graph { off, adj };
 
-    // 3. Renumber nodes so a search walks nearby memory: every thread grows breadth-first regions
-    //    from seeds in its own id range, claiming nodes with an atomic flag, and the threads'
-    //    visiting orders, one after another, are the new numbering.
-    let claimed: Vec<AtomicBool> = (0..n).map(|_| AtomicBool::new(false)).collect();
-    let orders: Vec<Vec<u32>> = thread::scope(|sc| {
-        let hs: Vec<_> = (0..nt).map(|i| {
-            let (fwd, claimed) = (&fwd, &claimed);
-            sc.spawn(move || {
-                let mut order = Vec::new();
-                for root in n * i / nt..n * (i + 1) / nt {
-                    if claimed[root].swap(true, Relaxed) {
-                        continue;
-                    }
-                    let mut h = order.len();
-                    order.push(root as u32);
-                    while h < order.len() {
-                        if let Some(&f) = order.get(h + 8) {
-                            prefetch(&fwd.off[f as usize]);
-                        }
-                        if let Some(e) = order.get(h + 4).and_then(|&f| fwd.adj.get(fwd.off[f as usize] as usize)) {
-                            prefetch(e);
-                        }
-                        let u = order[h] as usize;
-                        h += 1;
-                        for &[v, _] in &fwd.adj[fwd.off[u] as usize..fwd.off[u + 1] as usize] {
-                            if !claimed[v as usize].load(Relaxed) && !claimed[v as usize].swap(true, Relaxed) {
-                                order.push(v);
-                            }
-                        }
-                    }
-                }
-                order
-            })
-        }).collect();
-        hs.into_iter().map(|h| h.join().unwrap()).collect()
-    });
-    drop(claimed);
-    let ins: Vec<AtomicU32> = (0..=n).map(|_| AtomicU32::new(0)).collect();
-    let (fwd, rank) = renumber(fwd, &orders, &ins);
-    drop(orders);
+    // 3. Renumber nodes for locality, then derive the reverse graph.
+    let (fwd, ins, rank) = renumber(fwd, nt);
     let bwd = transpose(&fwd, &ins, nt);
     drop(ins);
 
@@ -518,7 +509,7 @@ fn main() {
     let mut pairs = Vec::new();
     let mut p = 0;
     while p < q.len() {
-        pairs.push((rank[num(&q, &mut p) as usize], rank[num(&q, &mut p) as usize]));
+        pairs.push((rank(num(&q, &mut p) as usize), rank(num(&q, &mut p) as usize)));
     }
     drop(rank);
     let narrow = n <= 1 << 21; // node ids fit u64 heap keys
