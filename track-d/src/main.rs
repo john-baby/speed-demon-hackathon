@@ -392,8 +392,6 @@ impl<'g, K: Key> Side<'g, K> {
 
 // Stop once the two frontiers together cannot beat the best path found; an empty side tops at MAX.
 // None when a distance does not fit K.
-const BATCH: usize = 8;
-
 fn query<'g, K: Key>(f: &mut Side<'g, K>, b: &mut Side<'g, K>, s: u32, t: u32) -> Option<u64> {
     if s == t {
         return Some(0);
@@ -407,17 +405,10 @@ fn query<'g, K: Key>(f: &mut Side<'g, K>, b: &mut Side<'g, K>, s: u32, t: u32) -
             return Some(best);
         }
         // Grow the smaller frontier: a side that is about to run dry (an island, a dead end)
-        // finishes first instead of letting the other side flood the graph. A few steps per
-        // choice: deciding every step mispredicts often, and settling a few nodes more than
-        // needed at the end cannot make the answer wrong.
-        let (side, other) = if f.heap.len() <= b.heap.len() { (&mut *f, &*b) } else { (&mut *b, &*f) };
-        for _ in 0..BATCH {
-            if side.top() == u64::MAX {
-                break;
-            }
-            if !side.step(other, &mut best) {
-                return None;
-            }
+        // finishes first instead of letting the other side flood the graph.
+        let ok = if f.heap.len() <= b.heap.len() { f.step(b, &mut best) } else { b.step(f, &mut best) };
+        if !ok {
+            return None;
         }
     }
 }
