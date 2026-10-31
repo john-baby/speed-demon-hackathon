@@ -12,6 +12,9 @@ Every step from the reference to your final version, each with the live-board ru
 | 5 | Hide the name table's cache miss: compute each name's key and home slot as soon as it is parsed and prefetch that slot's line, then update the previous record's name, whose line has had a whole record's parsing to arrive | run-9afc9ed38224 | 0.070 | 14.7 | 67.5 |
 | 6 | Take the 8 MB name table as zeroed pages from the allocator instead of writing it on one thread before the parse; the parsing threads fault the pages in as they touch them | run-d3ed05cbee11 | 0.070 | 14.7 | 67.6 |
 | 7 | Finish each record one record later: its region's entry in the 2 MB region-to-country array is prefetched along with its name slot, and both are used while the next record is parsed | run-a6b32c0a65ee | 0.068 | 14.6 | 67.7 |
+| 8 | Structural scanning: SSE2 compares build 64-byte masks of quotes, commas and LFs, a prefix XOR of the quote mask marks quoted bytes, and the record loop reads its five delimiters from the remaining bits, with field lengths from quote counts. Group masks moved out of the shared name table: parsing runs in rounds, each record's (name slot, group) goes to a bucket for the thread that owns that slot's masks, and after a barrier each owner sets its own bits with plain writes, so no cache line is written by two cores | run-235961e6489a | 0.060 | 17.0 | 67.8 |
+| 9 | AVX2 masks, delimiters scanned a 64 KB stretch ahead into a position array (one hard-to-predict branch per 64-byte block rather than per field), and numbers parsed without loops (one 8-byte load, digit pairs combined by multiplies). Reverted: no faster on the board, and S rose from 516 to 573 | run-739ff375d24e | 0.063 | 17.7 | 66.7 |
+| 10 | Step 8's code again. Steps 8 and 10 are the same build, so 0.060 s to 0.062 s is the board's run-to-run spread | run-030a52ef2645 | 0.062 | 17.5 | 67.4 |
 
 ## Notes
 
@@ -26,3 +29,5 @@ Every step from the reference to your final version, each with the live-board ru
 - Step 4 on the board: T 88 ms to 81 ms, and M 21.8 MB to 14.9 MB because `regions.csv` is mapped instead of read and copied into a row list.
 - Step 5 on the board: T 81 ms to 70 ms, with the same memory.
 - Step 6 on the board: no measurable change (70.3 ms to 69.8 ms), so zero-filling the table on one thread was not a real cost.
+- Step 7 board profile (run-45920caff785, an instrumented build that writes its phase times into an extra file name, so the run fails the output check on purpose): regions 1.7 ms, parse 49.6 ms, distinct count 7.3 ms. The same build with name tracking switched off (run-3ef3af02445e) parsed in 34.2 ms and finished in 36.7 ms instead of 58.9 ms, so the shared name table cost about 22 ms. Each atomic OR on a group mask invalidated the line that other threads read the name's key from. Step 8 separates the two.
+- After step 8, a laptop breakdown with one thread: SIMD scanning alone 78 ms over 223 MB (2.9 GB/s), field extraction and number parsing +100 ms, name hashing +15 ms, group aggregates +20 ms, name slots and mask buckets +125 ms.
