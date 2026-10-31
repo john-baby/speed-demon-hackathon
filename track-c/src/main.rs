@@ -106,20 +106,36 @@ impl<'a> Fields<'a> {
         self.bits = (c | n) & !inq;
     }
 
-    // The next comma or LF outside quotes, and how many quote bytes precede it.
-    fn next(&mut self) -> (usize, usize) {
-        while self.bits == 0 {
-            self.qbase += self.quotes.count_ones() as usize;
+    // Append the next `blocks` blocks' commas and LFs outside quotes, each with the number of quote
+    // bytes before it (mod 2^32), in file order. One branch per block, rather than one per field.
+    fn fill(&mut self, buf: &mut Vec<[u32; 2]>, blocks: usize) {
+        for _ in 0..blocks {
+            if self.block >= self.d.len() {
+                return;
+            }
+            let (mut b, q) = (self.bits, self.quotes);
+            while b != 0 {
+                let off = b.trailing_zeros();
+                buf.push([(self.block + off as usize) as u32, (self.qbase + (q & ((1u64 << off) - 1)).count_ones() as usize) as u32]);
+                b &= b - 1;
+            }
+            self.qbase += q.count_ones() as usize;
             self.block += 64;
             self.load();
         }
-        let off = self.bits.trailing_zeros();
-        self.bits &= self.bits - 1;
-        (self.block + off as usize, self.qbase + (self.quotes & ((1u64 << off) - 1)).count_ones() as usize)
     }
 }
 
-// Bit i set where the 64 bytes at s hold b, 16 bytes per SSE2 compare.
+// Bit i set where the 64 bytes at s hold b: 32 bytes per AVX2 compare where the build target has
+// it (the scoring box does), else 16 per SSE2 compare.
+#[cfg(target_feature = "avx2")]
+fn mask(s: &[u8], b: u8) -> u64 {
+    use std::arch::x86_64::*;
+    let half = |k: usize| unsafe { _mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_loadu_si256(s[32 * k..].as_ptr() as *const __m256i), _mm256_set1_epi8(b as i8))) as u32 as u64 };
+    half(0) | half(1) << 32
+}
+
+#[cfg(not(target_feature = "avx2"))]
 fn mask(s: &[u8], b: u8) -> u64 {
     use std::arch::x86_64::*;
     let mut m = 0u64;
@@ -132,6 +148,22 @@ fn mask(s: &[u8], b: u8) -> u64 {
 
 fn digits(d: &[u8]) -> i64 {
     d.iter().fold(0, |x, &b| x * 10 + (b - b'0') as i64)
+}
+
+// The decimal number in d[s..e], without a loop when it has at most 8 digits: load the 8 bytes
+// ending at e, turn the bytes before s into '0's, and combine digit pairs, then pairs of pairs.
+fn number(d: &[u8], s: usize, e: usize) -> i64 {
+    let len = e - s;
+    if len > 8 || e < 8 {
+        return digits(&d[s..e]);
+    }
+    let w = u64::from_le_bytes(d[e - 8..e].try_into().unwrap());
+    let keep = !0u64 << (8 * (8 - len));
+    let mut v = ((w & keep) | (0x3030_3030_3030_3030 & !keep)).wrapping_sub(0x3030_3030_3030_3030);
+    v = v.wrapping_mul(10).wrapping_add(v >> 8) & 0x00ff_00ff_00ff_00ff;
+    v = v.wrapping_mul(100).wrapping_add(v >> 16) & 0x0000_ffff_0000_ffff;
+    v = v.wrapping_mul(10000).wrapping_add(v >> 32) & 0xffff_ffff;
+    v as i64
 }
 
 #[derive(Clone, Copy)]
@@ -180,9 +212,17 @@ struct Lookup {
 
 impl Names {
     fn lookup(&self, d: &[u8], s: usize, len: usize) -> Lookup {
-        let mut b = [0u8; 24];
-        b[..len.min(24)].copy_from_slice(&d[s..s + len.min(24)]);
-        let key: [u64; 3] = std::array::from_fn(|i| u64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().unwrap()));
+        // The first 24 bytes, zero past the name: three loads and masks, or a copy at the file's end.
+        let key: [u64; 3] = if s + 24 <= d.len() {
+            std::array::from_fn(|i| {
+                let k = len.saturating_sub(8 * i).min(8);
+                u64::from_le_bytes(d[s + 8 * i..s + 8 * i + 8].try_into().unwrap()) & if k == 8 { !0 } else { (1 << (8 * k)) - 1 }
+            })
+        } else {
+            let mut b = [0u8; 24];
+            b[..len.min(24)].copy_from_slice(&d[s..s + len.min(24)]);
+            std::array::from_fn(|i| u64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().unwrap()))
+        };
         let h = (key[0] ^ key[1].rotate_left(21) ^ key[2].rotate_left(42) ^ len as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
         let i = (h >> (64 - NAME_BITS)) as usize;
         prefetch(&self.slots[i]);
@@ -228,6 +268,8 @@ impl Names {
 // by their owner and no cache line bounces between cores.
 struct Chunk<'a> {
     f: Fields<'a>,
+    found: Vec<[u32; 2]>, // delimiters scanned ahead, from found[next]
+    next: usize,
     p: usize,
     end: usize,
     aggs: Vec<Agg>,
@@ -263,19 +305,31 @@ impl<'a> Chunk<'a> {
         // A field of n bytes holding q quote bytes is a value of n bytes when q is 0, and of
         // n - 1 - q/2 bytes when quoted: two delimiting quotes and one byte saved per "" escape.
         let value_len = |n: usize, q: usize| if q == 0 { n } else { n - 1 - q / 2 };
-        let (f, mut p) = (&mut self.f, self.p);
+        let (f, found, mut next, mut p) = (&mut self.f, &mut self.found, self.next, self.p);
         let until = until.min(self.end);
         while p < until {
+            if found.len() - next < 5 {
+                found.drain(..next);
+                next = 0;
+                let had = found.len();
+                f.fill(found, 1024);
+                assert!(found.len() > had, "truncated record");
+                continue;
+            }
             p += if d[p..].starts_with(BOM) { 3 } else { 0 };
-            let ((c1, q1), (c2, q2), (c3, q3), (c4, _), (lf, _)) = (f.next(), f.next(), f.next(), f.next(), f.next());
-            let id = digits(&d[p..c1]);
-            let name = if q2 > q1 { &d[c1 + 2..c2 - 1] } else { &d[c1 + 1..c2] };
-            let name_len = value_len(c2 - c1 - 1, q2 - q1);
-            let note_len = value_len(c3 - c2 - 1, q3 - q2);
-            let region = digits(&d[c3 + 1..c4]) as usize;
-            let amount = &d[c4 + 1..lf - (d[lf - 1] == b'\r') as usize];
-            let negative = amount[0] == b'-';
-            let cents = (digits(&amount[negative as usize..amount.len() - 3]) * 100 + digits(&amount[amount.len() - 2..])) * if negative { -1 } else { 1 };
+            let e = &found[next..next + 5];
+            next += 5;
+            let [c1, c2, c3, c4, lf] = [0, 1, 2, 3, 4].map(|k| e[k][0] as usize);
+            // Quote bytes in the name and in the note.
+            let (q2, q3) = (e[1][1].wrapping_sub(e[0][1]) as usize, e[2][1].wrapping_sub(e[1][1]) as usize);
+            let id = number(d, p, c1);
+            let name = if q2 > 0 { &d[c1 + 2..c2 - 1] } else { &d[c1 + 1..c2] };
+            let name_len = value_len(c2 - c1 - 1, q2);
+            let note_len = value_len(c3 - c2 - 1, q3);
+            let region = number(d, c3 + 1, c4) as usize;
+            let end = lf - (d[lf - 1] == b'\r') as usize;
+            let negative = d[c4 + 1] == b'-';
+            let cents = (number(d, c4 + 1 + negative as usize, end - 3) * 100 + ((d[end - 2] - b'0') * 10 + d[end - 1] - b'0') as i64) * (1 - 2 * negative as i64);
             p = lf + 1;
 
             // Finish the previous record while this one's region and name lines are on their way in.
@@ -291,6 +345,7 @@ impl<'a> Chunk<'a> {
             finish(&mut self.aggs, prev);
         }
         self.p = p;
+        self.next = next;
     }
 }
 
@@ -347,6 +402,7 @@ fn main() {
     // 2. Split records.csv at record starts. Notes are lowercase words and quotes and names never
     //    hold an LF, so an LF followed by a digit or a BOM always ends a record.
     let d = load(&format!("{data_dir}/records.csv"));
+    assert!(d.len() < u32::MAX as usize, "delimiter positions are u32");
     let header = d.strip_prefix(BOM).map_or(0, |_| 3);
     let mut starts = vec![find(d, header, b'\n') + 1];
     for i in 1..nt {
@@ -383,7 +439,7 @@ fn main() {
             let (s, e, ctx, buckets, barrier) = (starts[t], starts[t + 1], &ctx, &buckets, &barrier);
             sc.spawn(move || {
                 let empty = Agg { count: 0, id_sum: 0, amount_sum: 0, min: i64::MAX, max: i64::MIN, name_bytes: 0, note_bytes: 0 };
-                let mut chunk = Chunk { f: Fields::new(d, s), p: s, end: e, aggs: vec![empty; groups] };
+                let mut chunk = Chunk { f: Fields::new(d, s), found: Vec::with_capacity(16384), next: 0, p: s, end: e, aggs: vec![empty; groups] };
                 // This thread's group masks: those of slots lo..hi.
                 let (lo, hi) = (((t << NAME_BITS) + nt - 1) / nt, (((t + 1) << NAME_BITS) + nt - 1) / nt);
                 let mut masks = vec![[0u64; 4]; hi - lo];
