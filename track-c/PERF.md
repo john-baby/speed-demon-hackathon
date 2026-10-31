@@ -10,7 +10,8 @@ Every step from the reference to your final version, each with the live-board ru
 | 3 | One 64-byte cache line per name slot holding the claimed offset and length, the name's first 24 bytes and its group mask, so a lookup is one cache miss instead of three; names over 24 bytes compare the rest against their first occurrence; 2^17 slots keep the table at 8 MB | run-6ba0d0eeac90 | 0.088 | 21.8 | 63.8 |
 | 4 | No quote-counting pass: by the spec's section 2.2 notes are lowercase words and quotes and names never hold an LF, so an LF followed by a digit or a BOM always ends a record, and each thread finds its first record start directly. `regions.csv` is mapped and parsed in parallel into a region-to-country-code array, with groups looked up through a 26^3 rank table, instead of 200,000 lines on one thread | run-e4f06a156ca2 | 0.081 | 14.9 | 66.0 |
 | 5 | Hide the name table's cache miss: compute each name's key and home slot as soon as it is parsed and prefetch that slot's line, then update the previous record's name, whose line has had a whole record's parsing to arrive | run-9afc9ed38224 | 0.070 | 14.7 | 67.5 |
-| 6 | Take the 8 MB name table as zeroed pages from the allocator instead of writing it on one thread before the parse; the parsing threads fault the pages in as they touch them | | | | |
+| 6 | Take the 8 MB name table as zeroed pages from the allocator instead of writing it on one thread before the parse; the parsing threads fault the pages in as they touch them | run-d3ed05cbee11 | 0.070 | 14.7 | 67.6 |
+| 7 | Finish each record one record later: its region's entry in the 2 MB region-to-country array is prefetched along with its name slot, and both are used while the next record is parsed | | | | |
 
 ## Notes
 
@@ -24,3 +25,4 @@ Every step from the reference to your final version, each with the live-board ru
 - Step 3 on the board: T 90 ms to 88 ms, a smaller gain than on the laptop; at 12 threads the serial steps around the parse (regions on one thread, the quote-counting pass) are a bigger share.
 - Step 4 on the board: T 88 ms to 81 ms, and M 21.8 MB to 14.9 MB because `regions.csv` is mapped instead of read and copied into a row list.
 - Step 5 on the board: T 81 ms to 70 ms, with the same memory.
+- Step 6 on the board: no measurable change (70.3 ms to 69.8 ms), so zero-filling the table on one thread was not a real cost.

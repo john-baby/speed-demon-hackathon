@@ -118,6 +118,15 @@ struct Names {
     slots: Vec<Slot>,
 }
 
+// Ask for the cache line holding r, without waiting for it.
+fn prefetch<T>(r: &T) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        use std::arch::x86_64::*;
+        _mm_prefetch(r as *const T as *const i8, _MM_HINT_T0);
+    }
+}
+
 // A name's key and home slot, computed one record ahead so its cache line can be prefetched.
 struct Lookup {
     s: usize,
@@ -133,11 +142,7 @@ impl Names {
         let key: [u64; 3] = std::array::from_fn(|i| u64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().unwrap()));
         let h = (key[0] ^ key[1].rotate_left(21) ^ key[2].rotate_left(42) ^ len as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
         let i = (h >> (64 - NAME_BITS)) as usize;
-        #[cfg(target_arch = "x86_64")]
-        unsafe {
-            use std::arch::x86_64::*;
-            _mm_prefetch(&self.slots[i] as *const Slot as *const i8, _MM_HINT_T0);
-        }
+        prefetch(&self.slots[i]);
         Lookup { s, len, key, i }
     }
 
@@ -184,6 +189,18 @@ fn parse(d: &[u8], start: usize, end: usize, code_of: &[u16], rank: &[u16], unma
     let empty = Agg { count: 0, id_sum: 0, amount_sum: 0, min: i64::MAX, max: i64::MIN, name_bytes: 0, note_bytes: 0 };
     let mut aggs = vec![empty; unmatched + 1];
     let mut pending = None;
+    let finish = |aggs: &mut [Agg], (l, region, id, cents, name_bytes, bytes): (Lookup, usize, i64, i64, usize, i64)| {
+        let g = code_of.get(region).filter(|&&c| c != NONE).map_or(unmatched, |&c| rank[c as usize] as usize);
+        let a = &mut aggs[g];
+        a.count += 1;
+        a.id_sum += id;
+        a.amount_sum += cents;
+        a.min = a.min.min(cents);
+        a.max = a.max.max(cents);
+        a.name_bytes += name_bytes as i64;
+        a.note_bytes += bytes - name_bytes as i64;
+        names.add(d, &l, g);
+    };
     let mut p = start;
     while p < end {
         if d[p..].starts_with(BOM) {
@@ -200,23 +217,18 @@ fn parse(d: &[u8], start: usize, end: usize, code_of: &[u16], rank: &[u16], unma
         p += 2;
         p += if d.get(p) == Some(&b'\r') { 2 } else { 1 };
 
-        let g = code_of.get(region).filter(|&&c| c != NONE).map_or(unmatched, |&c| rank[c as usize] as usize);
-        let a = &mut aggs[g];
-        a.count += 1;
-        a.id_sum += id;
-        a.amount_sum += cents;
-        a.min = a.min.min(cents);
-        a.max = a.max.max(cents);
-        a.name_bytes += (name.len() - name_esc) as i64;
-        a.note_bytes += (note.len() - note_esc) as i64;
-        // Record the previous name while this one's slot is on its way into the cache.
+        // Finish the previous record while this one's region and name lines are on their way in.
+        if let Some(r) = code_of.get(region) {
+            prefetch(r);
+        }
         let l = names.lookup(d, name.as_ptr() as usize - d.as_ptr() as usize, name.len());
-        if let Some((prev, pg)) = pending.replace((l, g)) {
-            names.add(d, &prev, pg);
+        let bytes = (name.len() - name_esc + note.len() - note_esc) as i64;
+        if let Some(prev) = pending.replace((l, region, id, cents, name.len() - name_esc, bytes)) {
+            finish(&mut aggs, prev);
         }
     }
-    if let Some((prev, pg)) = pending {
-        names.add(d, &prev, pg);
+    if let Some(prev) = pending {
+        finish(&mut aggs, prev);
     }
     aggs
 }
