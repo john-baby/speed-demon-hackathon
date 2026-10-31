@@ -7,7 +7,7 @@ The task, the input files and the exact output format are in the [spec](https://
 Rust, standard library only, one binary (`src/main.rs`), x86-64 (SSE2 intrinsics).
 
 1. **Map, don't read.** `/data/requests.log` is `mmap`ed read-only. The host has already loaded it into the page cache, so the 239 MB input is never copied into our memory.
-2. **One pass, in parallel.** The file is cut into one chunk per available core, at line boundaries. Each thread reads its chunk exactly once and never decodes text or parses dates:
+2. **One pass, in parallel.** The file is cut at line boundaries into eight pieces per available core. Each thread parses its own run of pieces in order, then helps with what is left of the others' runs, so a slower core does less. Every byte is read exactly once, and nothing decodes text or parses dates:
    - SIMD compares mark every space and newline, 64 bytes at a time. A line has exactly four spaces and a newline, so the separator positions come in fives and give every field without searching;
    - the hour comes straight from the day and hour digits (the 72-hour span is fixed by the spec, so `hour = day_offset * 24 + HH - 18`);
    - the endpoint is interned in a small thread-local hash table and checked against the stored name with one fixed-size 64-byte compare;
