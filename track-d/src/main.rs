@@ -104,6 +104,32 @@ fn renumber(g: Graph, order: &[u32], rank: &[u32], nt: usize) -> Graph {
     Graph { off, adj }
 }
 
+// The reverse graph of g: count in-degrees, then place every edge u -> v as v <- u. Once nodes are
+// renumbered for locality, u and v are mostly close, so the counters and the writes stay local.
+fn transpose(g: &Graph, nt: usize) -> Graph {
+    let n = g.off.len() - 1;
+    let ins: Vec<AtomicU32> = (0..=n).map(|_| AtomicU32::new(0)).collect();
+    let each = |f: &(dyn Fn(usize, u32, u32) + Sync)| thread::scope(|sc| {
+        for i in 0..nt {
+            sc.spawn(move || {
+                for u in n * i / nt..n * (i + 1) / nt {
+                    for &[v, w] in &g.adj[g.off[u] as usize..g.off[u + 1] as usize] {
+                        f(u, v, w);
+                    }
+                }
+            });
+        }
+    });
+    each(&|_, v, _| {
+        ins[v as usize].fetch_add(1, Relaxed);
+    });
+    let off = offsets(&ins);
+    let mut adj = vec![[0u32; 2]; g.adj.len()];
+    let out = Shared(adj.as_mut_ptr());
+    each(&|u, v, w| unsafe { *out.at(ins[v as usize].fetch_add(1, Relaxed) as usize) = [u as u32, w] });
+    Graph { off, adj }
+}
+
 // Distances of one search, in a small open-addressing table so a search costs what it touches.
 struct Map {
     keys: Vec<u32>,
@@ -249,35 +275,31 @@ fn main() {
     bounds.push(body.len());
     let chunks: Vec<&[u8]> = (0..nt).map(|i| &body[bounds[i]..bounds[i + 1]]).collect();
 
-    // 1. Count out- and in-degrees in parallel.
+    // 1. Count out-degrees in parallel.
     let outs: Vec<AtomicU32> = (0..=n).map(|_| AtomicU32::new(0)).collect();
-    let ins: Vec<AtomicU32> = (0..=n).map(|_| AtomicU32::new(0)).collect();
     thread::scope(|sc| {
         for c in &chunks {
-            let (outs, ins) = (&outs, &ins);
-            sc.spawn(move || each_edge(c, |u, v, _| {
+            let outs = &outs;
+            sc.spawn(move || each_edge(c, |u, _, _| {
                 outs[u].fetch_add(1, Relaxed);
-                ins[v].fetch_add(1, Relaxed);
             }));
         }
     });
 
-    // 2. Parse again and place every edge in the forward and the reverse graph.
-    let (fo, bo) = (offsets(&outs), offsets(&ins));
+    // 2. Parse again and place every edge in the forward graph.
+    let fo = offsets(&outs);
     let m = fo[n] as usize;
     let mut fwd = Graph { off: fo, adj: vec![[0; 2]; m] };
-    let mut bwd = Graph { off: bo, adj: vec![[0; 2]; m] };
-    let (fa, ba) = (Shared(fwd.adj.as_mut_ptr()), Shared(bwd.adj.as_mut_ptr()));
+    let fa = Shared(fwd.adj.as_mut_ptr());
     thread::scope(|sc| {
         for c in &chunks {
-            let (outs, ins) = (&outs, &ins);
+            let outs = &outs;
             sc.spawn(move || each_edge(c, |u, v, w| unsafe {
                 *fa.at(outs[u].fetch_add(1, Relaxed) as usize) = [v as u32, w];
-                *ba.at(ins[v].fetch_add(1, Relaxed) as usize) = [u as u32, w];
             }));
         }
     });
-    drop((outs, ins));
+    drop(outs);
 
     // 3. Renumber nodes so a search walks nearby memory: every thread grows breadth-first regions
     //    from seeds in its own id range, claiming nodes with an atomic flag, and the threads'
@@ -317,8 +339,8 @@ fn main() {
         rank[u as usize] = x as u32;
     }
     let fwd = renumber(fwd, &order, &rank, nt);
-    let bwd = renumber(bwd, &order, &rank, nt);
     drop(order);
+    let bwd = transpose(&fwd, nt);
 
     // 4. Answer the queries on every core, each thread taking the next unanswered one.
     let q = std::fs::read(format!("{data_dir}/queries.txt")).unwrap();
