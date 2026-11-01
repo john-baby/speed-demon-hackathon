@@ -78,39 +78,6 @@ impl PrefixFilter {
     }
 }
 
-// Open-addressing map from a u64 key (never u64::MAX) to a u32, sized for `n` entries.
-struct Map {
-    keys: Vec<u64>,
-    vals: Vec<u32>,
-}
-
-impl Map {
-    fn new(n: usize) -> Map {
-        let size = (n * 2).next_power_of_two().max(16);
-        Map { keys: vec![u64::MAX; size], vals: vec![0; size] }
-    }
-
-    fn slot(&self, k: u64, h: u64) -> usize {
-        let mask = self.keys.len() - 1;
-        let mut i = h as usize & mask;
-        while self.keys[i] != k && self.keys[i] != u64::MAX {
-            i = (i + 1) & mask;
-        }
-        i
-    }
-
-    fn get(&self, k: u64) -> u32 {
-        let i = self.slot(k, k.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 20);
-        if self.keys[i] == k { self.vals[i] } else { NONE }
-    }
-
-    fn insert(&mut self, k: u64, v: u32) {
-        let i = self.slot(k, k.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 20);
-        self.keys[i] = k;
-        self.vals[i] = v;
-    }
-}
-
 // The distinct query terms, numbered in order of first appearance.
 struct Terms {
     keys: Vec<Key>,
@@ -150,55 +117,99 @@ enum Query {
     Phrase(u32),          // the automaton node that ends the phrase
 }
 
-// Aho-Corasick over term ids: every phrase is a path from the root; fail[s] is the longest proper
-// suffix of s's path that is also a path, and out[s] the nearest node on s's fail chain (s itself
-// included) where a phrase ends.
+// Aho-Corasick over term ids with O(1) direct root transitions and sorted flat non-root edges.
 struct Automaton {
-    goto: Map, // node << 32 | term -> node
+    root_goto: Vec<u32>,    // direct O(1) transitions from root state 0
+    edge_start: Vec<u32>,   // slice offset into edges for non-root states
+    edges: Vec<(u32, u32)>, // sorted by term (t, v) for non-root states
     fail: Vec<u32>,
     out: Vec<u32>,
 }
 
 impl Automaton {
+    #[inline(always)]
     fn step(&self, mut s: u32, t: u32) -> u32 {
+        if s == 0 {
+            return self.root_goto[t as usize];
+        }
         loop {
-            let v = self.goto.get((s as u64) << 32 | t as u64);
-            if v != NONE {
-                return v;
-            }
-            if s == 0 {
-                return 0;
+            let lo = self.edge_start[s as usize] as usize;
+            let hi = self.edge_start[s as usize + 1] as usize;
+            let len = hi - lo;
+            if len == 1 {
+                let (term, next) = self.edges[lo];
+                if term == t {
+                    return next;
+                }
+            } else if len > 1 {
+                let slice = &self.edges[lo..hi];
+                if let Ok(idx) = slice.binary_search_by_key(&t, |&(term, _)| term) {
+                    return slice[idx].1;
+                }
             }
             s = self.fail[s as usize];
+            if s == 0 {
+                return self.root_goto[t as usize];
+            }
         }
     }
 }
 
-fn build(phrases: &[Vec<u32>]) -> (Automaton, Vec<u32>) {
+fn build(phrases: &[Vec<u32>], nterms: usize) -> (Automaton, Vec<u32>) {
     let mut children: Vec<Vec<(u32, u32)>> = vec![vec![]];
-    let mut goto = Map::new(phrases.iter().map(|p| p.len()).sum());
-    let mut ends = Vec::new();
+    let mut root_goto = vec![0u32; nterms];
+    let mut ends = Vec::with_capacity(phrases.len());
+
     for p in phrases {
         let mut s = 0u32;
         for &t in p {
-            let key = (s as u64) << 32 | t as u64;
-            let mut v = goto.get(key);
-            if v == NONE {
+            let mut v = if s == 0 {
+                root_goto[t as usize]
+            } else {
+                children[s as usize]
+                    .iter()
+                    .find(|&&(term, _)| term == t)
+                    .map(|&(_, node)| node)
+                    .unwrap_or(0)
+            };
+            if v == 0 {
                 v = children.len() as u32;
-                children.push(vec![]);
+                children.push(Vec::new());
+                if s == 0 {
+                    root_goto[t as usize] = v;
+                }
                 children[s as usize].push((t, v));
-                goto.insert(key, v);
             }
             s = v;
         }
         ends.push(s);
     }
+
     let n = children.len();
     let mut end = vec![false; n];
     for &e in &ends {
         end[e as usize] = true;
     }
-    let mut a = Automaton { goto, fail: vec![0; n], out: vec![NONE; n] };
+
+    let mut edge_start = Vec::with_capacity(n + 1);
+    let mut edges = Vec::new();
+    for s in 0..n {
+        edge_start.push(edges.len() as u32);
+        if s > 0 {
+            children[s].sort_unstable_by_key(|&(term, _)| term);
+            edges.extend_from_slice(&children[s]);
+        }
+    }
+    edge_start.push(edges.len() as u32);
+
+    let mut a = Automaton {
+        root_goto,
+        edge_start,
+        edges,
+        fail: vec![0; n],
+        out: vec![NONE; n],
+    };
+
     let mut order: Vec<u32> = children[0].iter().map(|&(_, v)| v).collect();
     let mut h = 0;
     while h < order.len() {
@@ -276,13 +287,15 @@ fn on_token_action(
         *state = 0;
     } else {
         *state = ac.step(*state, t);
-        let mut x = ac.out[*state as usize];
-        while x != NONE {
-            if last_hit[x as usize] != doc {
-                last_hit[x as usize] = doc;
-                part.hits.push((x, doc));
+        if *state != 0 {
+            let mut x = ac.out[*state as usize];
+            while x != NONE {
+                if last_hit[x as usize] != doc {
+                    last_hit[x as usize] = doc;
+                    part.hits.push((x, doc));
+                }
+                x = ac.out[ac.fail[x as usize] as usize];
             }
-            x = ac.out[ac.fail[x as usize] as usize];
         }
     }
 }
@@ -528,7 +541,7 @@ fn main() {
             in_phrase[t as usize] = true;
         }
     }
-    let (ac, ends) = build(&phrases);
+    let (ac, ends) = build(&phrases, nterms);
     let nodes = ac.fail.len();
 
     // 2. Scan the documents in parallel, one range of whole lines per thread.
@@ -797,5 +810,73 @@ mod tests {
         let mut k = [0u8; 32];
         k[..5].copy_from_slice(b"zztop");
         assert!(!terms.filter.may_contain(&k, 5));
+    }
+
+    #[test]
+    fn test_ac_phrase_transitions_and_failure_links() {
+        // Phrases: "bail bond" (terms [0, 1]), "bail bail bond" (terms [0, 0, 1]), "bond bail" (terms [1, 0])
+        let phrases = vec![
+            vec![0, 1],       // Phrase 0: bail bond
+            vec![0, 0, 1],    // Phrase 1: bail bail bond
+            vec![1, 0],       // Phrase 2: bond bail
+        ];
+        let nterms = 3;
+        let (ac, ends) = build(&phrases, nterms);
+
+        // From root: 0 -> bail (term 0) -> node 1
+        let s1 = ac.step(0, 0);
+        assert_eq!(s1, 1);
+        // From root: 0 -> bond (term 1) -> node 5 (or other allocated node)
+        let s_bond = ac.step(0, 1);
+        assert_ne!(s_bond, 0);
+        // Non-initial term (term 2) from root: returns 0
+        assert_eq!(ac.step(0, 2), 0);
+
+        // Match sequence: bail bail bond
+        // 1. token 0 (bail)
+        let mut st = ac.step(0, 0);
+        assert_eq!(ac.out[st as usize], NONE);
+        // 2. token 0 (bail) -> enters node for "bail bail"
+        st = ac.step(st, 0);
+        assert_eq!(ac.out[st as usize], NONE);
+        // 3. token 1 (bond) -> completes "bail bail bond" (ends[1]) and suffix "bail bond" (ends[0])
+        st = ac.step(st, 1);
+        assert_eq!(st, ends[1]);
+        // out link must match phrase 1 itself
+        assert_eq!(ac.out[st as usize], ends[1]);
+        // fail chain must reach phrase 0
+        let next_out = ac.out[ac.fail[st as usize] as usize];
+        assert_eq!(next_out, ends[0]);
+    }
+
+    #[test]
+    fn test_ac_eight_token_phrase() {
+        // An 8-token phrase: 0 1 2 3 4 5 6 7
+        let p: Vec<u32> = (0..8).collect();
+        let phrases = vec![p.clone()];
+        let (ac, ends) = build(&phrases, 10);
+
+        let mut st = 0;
+        for &t in &p {
+            st = ac.step(st, t);
+        }
+        assert_eq!(st, ends[0]);
+        assert_eq!(ac.out[st as usize], ends[0]);
+    }
+
+    #[test]
+    fn test_ac_overlapping_phrases() {
+        // Overlapping: "a b c" [0, 1, 2] and "b c d" [1, 2, 3]
+        let phrases = vec![vec![0, 1, 2], vec![1, 2, 3]];
+        let (ac, ends) = build(&phrases, 4);
+
+        // Sequence: 0, 1, 2, 3
+        let s0 = ac.step(0, 0);
+        let s1 = ac.step(s0, 1);
+        let s2 = ac.step(s1, 2);
+        assert_eq!(s2, ends[0]); // matches "a b c"
+
+        let s3 = ac.step(s2, 3);
+        assert_eq!(s3, ends[1]); // matches "b c d" via fail transition!
     }
 }

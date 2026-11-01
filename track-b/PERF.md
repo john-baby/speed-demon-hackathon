@@ -15,7 +15,7 @@ Every step from the reference to your final version, each with the live-board ru
 | Phase 1 | Memory | 184.7 ms (sample) | 47.1 MB (sample) | Verified (`eeeec1e9...`) | Removed global `pairs` Vec; thread-local postings; dense terms stored only as bitmaps; code reduced by 15 lines (560 lines) |
 | Phase 2 | Tokenizer | 175.9 ms (sample) | 46.9 MB (sample) | Verified (`eeeec1e9...`) | AVX2 SIMD scanning, 32-byte block processing, SIMD case-folding & bitmask delimiter skipping |
 | Phase 3 | Prefix | 172.5 ms (sample) | 46.9 MB (sample) | Verified (`eeeec1e9...`) | 64K query-prefix bitmap lookup / fast rejection of non-query tokens; 8 KB L1-resident table |
-| Phase 4 | AC | TBD | TBD | TBD | Direct array root-state transition in Aho-Corasick |
+| Phase 4 | AC | 165.4 ms (sample) | 46.8 MB (sample) | Verified (`eeeec1e9...`) | O(1) direct root transitions; flat sorted non-root edge arrays; struct Map completely removed (-32 lines) |
 | Phase 5 | Boolean | TBD | TBD | TBD | SIMD bitwise ops and hardware popcount |
 | Phase 6 | Output | TBD | TBD | TBD | Preallocated buffer and branchless itoa |
 
@@ -56,6 +56,15 @@ Every step from the reference to your final version, each with the live-board ru
 - **Immediate Rejection of Non-Query Tokens:** Non-query tokens with impossible prefixes are immediately discarded with `*state = 0; return;`, bypassing the 32-byte token hash function and open-addressing hash table lookup completely.
 - **Zero Heap Allocations for Filter:** The prefix filter is embedded directly within `Terms` as fixed-size arrays (`[u64; 1024]` and `[u64; 4]`), avoiding pointer indirection and extra allocations.
 - **Unit & Differential Verification:** Unit tests confirm 100% of query terms pass the filter without false negatives. Official spec worked example and official sample seed-1 SHA-256 verified byte-for-byte (`eeeec1e9319da98a6f3c664c78f93e7078fd603c25c2bb3027174e81e3638a8f`).
+
+## Phase 4 Findings & Results
+
+- **Direct Root Transitions ($O(1)$):** Root state (`state 0`) transitions (accounting for >98% of all checks during document scanning) now use a flat direct lookup array `root_goto: Vec<u32>` indexed directly by `term_id`.
+- **Flat Sorted Non-Root Transitions:** Non-root states are stored in contiguous sorted slices (`edges: Vec<(u32, u32)>` and `edge_start: Vec<u32>`), replacing the hash table. 97.1% of branching non-root states have degree 1, which evaluates via a single integer equality comparison.
+- **`Map` Struct Completely Removed:** The 32-line open-addressing hash table `Map` was eliminated entirely from the codebase, reducing binary complexity, eliminating hash collisions, and improving the source line count ratio $S$.
+- **Fast Output Check Skip:** When `*state == 0`, output link traversal is bypassed entirely since root can never end a phrase query.
+- **Differential & Unit Testing:** All 5 unit tests pass, covering 2-token phrases, 8-token phrases, repeated terms, overlapping phrases, and failure link traversals. Verified byte-for-byte against the spec worked example (18 queries) and the sample seed-1 dataset (`eeeec1e9319da98a6f3c664c78f93e7078fd603c25c2bb3027174e81e3638a8f`).
+- **Benchmark Improvement:** Runtime dropped to a fastest run of **165.4 ms** on sample data.
 
 ## Notes
 
