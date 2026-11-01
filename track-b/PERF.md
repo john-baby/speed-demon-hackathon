@@ -16,7 +16,7 @@ Every step from the reference to your final version, each with the live-board ru
 | Phase 2 | Tokenizer | 175.9 ms (sample) | 46.9 MB (sample) | Verified (`eeeec1e9...`) | AVX2 SIMD scanning, 32-byte block processing, SIMD case-folding & bitmask delimiter skipping |
 | Phase 3 | Prefix | 172.5 ms (sample) | 46.9 MB (sample) | Verified (`eeeec1e9...`) | 64K query-prefix bitmap lookup / fast rejection of non-query tokens; 8 KB L1-resident table |
 | Phase 4 | AC | 165.4 ms (sample) | 46.8 MB (sample) | Verified (`eeeec1e9...`) | O(1) direct root transitions; flat sorted non-root edge arrays; struct Map completely removed (-32 lines) |
-| Phase 5 | Boolean | TBD | TBD | TBD | SIMD bitwise ops and hardware popcount |
+| Phase 5 | Boolean | 164.5 ms (sample) | 46.8 MB (sample) | Verified (`eeeec1e9...`) | AVX2 vector bitwise ops, hardware popcnt, early exit on 10 IDs, zero-alloc phrase result slices |
 | Phase 6 | Output | TBD | TBD | TBD | Preallocated buffer and branchless itoa |
 
 ## Phase 0 Baseline Analysis & Identified Bottlenecks
@@ -65,6 +65,16 @@ Every step from the reference to your final version, each with the live-board ru
 - **Fast Output Check Skip:** When `*state == 0`, output link traversal is bypassed entirely since root can never end a phrase query.
 - **Differential & Unit Testing:** All 5 unit tests pass, covering 2-token phrases, 8-token phrases, repeated terms, overlapping phrases, and failure link traversals. Verified byte-for-byte against the spec worked example (18 queries) and the sample seed-1 dataset (`eeeec1e9319da98a6f3c664c78f93e7078fd603c25c2bb3027174e81e3638a8f`).
 - **Benchmark Improvement:** Runtime dropped to a fastest run of **165.4 ms** on sample data.
+
+## Phase 5 Findings & Results
+
+- **AVX2 Vector Bitwise Operations:** Bitmap AND (`_mm256_and_si256`), OR (`_mm256_or_si256`), and NOT / set difference (`_mm256_andnot_si256`) process 256 bits (4 u64 words) per instruction with fallback for non-AVX2 environments.
+- **Hardware `popcnt` Aggregation:** Document counts over bitmaps evaluate in $O(\text{words})$ via hardware `count_ones()` (`popcnt`) instructions, executing in microseconds.
+- **Early Termination for Smallest 10 IDs:** ID extraction from bitmaps stops immediately after collecting 10 IDs instead of iterating through hundreds of thousands of set bits.
+- **Fast Integer Sum Evaluation:** Bitmap sums use `base * popcnt + bit_positions` with full-word `u64::MAX` shortcuts ($base \times 64 + 2016$).
+- **Zero-Allocation Phrase Slices:** Phrase query evaluation borrows directly from `hits` via `Set::PhraseSlice(&hits[lo..hi])`, eliminating ~19,000 intermediate `Vec<u32>` heap allocations.
+- **Two-Pointer Linear Scans:** Sparse posting list intersections and differences use branch-efficient two-pointer scans when list lengths are within 16x, with galloping fallback for highly asymmetrical list pairs.
+- **Unit & Differential Testing:** All 8 unit tests pass. Output checksum on the official seed-1 sample dataset verified byte-for-byte (`eeeec1e9319da98a6f3c664c78f93e7078fd603c25c2bb3027174e81e3638a8f`) and on the 18 spec worked example queries.
 
 ## Notes
 

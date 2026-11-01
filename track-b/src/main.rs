@@ -444,12 +444,28 @@ fn scan(d: &[u8], terms: &Terms, in_bool: &[bool], in_phrase: &[bool], ac: &Auto
 
 fn and(a: &[u32], b: &[u32]) -> Vec<u32> {
     let (a, b) = if a.len() <= b.len() { (a, b) } else { (b, a) };
-    let mut out = Vec::new();
-    let mut j = 0;
-    for &x in a {
-        j += b[j..].partition_point(|&y| y < x);
-        if j < b.len() && b[j] == x {
-            out.push(x);
+    let mut out = Vec::with_capacity(a.len());
+    if a.len() * 16 < b.len() {
+        let mut j = 0;
+        for &x in a {
+            j += b[j..].partition_point(|&y| y < x);
+            if j < b.len() && b[j] == x {
+                out.push(x);
+            }
+        }
+    } else {
+        let (mut i, mut j) = (0, 0);
+        while i < a.len() && j < b.len() {
+            let (x, y) = (a[i], b[j]);
+            if x == y {
+                out.push(x);
+                i += 1;
+                j += 1;
+            } else if x < y {
+                i += 1;
+            } else {
+                j += 1;
+            }
         }
     }
     out
@@ -470,27 +486,116 @@ fn or(a: &[u32], b: &[u32]) -> Vec<u32> {
 }
 
 fn not(a: &[u32], b: &[u32]) -> Vec<u32> {
-    let mut out = Vec::new();
-    let mut j = 0;
-    for &x in a {
-        j += b[j..].partition_point(|&y| y < x);
-        if j == b.len() || b[j] != x {
-            out.push(x);
+    let mut out = Vec::with_capacity(a.len());
+    if a.len() * 16 < b.len() {
+        let mut j = 0;
+        for &x in a {
+            j += b[j..].partition_point(|&y| y < x);
+            if j == b.len() || b[j] != x {
+                out.push(x);
+            }
         }
+    } else {
+        let (mut i, mut j) = (0, 0);
+        while i < a.len() && j < b.len() {
+            let (x, y) = (a[i], b[j]);
+            if x < y {
+                out.push(x);
+                i += 1;
+            } else if x == y {
+                i += 1;
+                j += 1;
+            } else {
+                j += 1;
+            }
+        }
+        out.extend_from_slice(&a[i..]);
     }
     out
 }
 
-// A running BOOL result: a sorted list while it is small, a bitmap over all documents once large.
-enum Set {
+#[inline(always)]
+fn bitmap_and(dst: &mut [u64], src: &[u64]) {
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx2") {
+        unsafe {
+            let mut i = 0;
+            while i + 4 <= dst.len() {
+                let d = _mm256_loadu_si256(dst.as_ptr().add(i) as *const __m256i);
+                let s = _mm256_loadu_si256(src.as_ptr().add(i) as *const __m256i);
+                let r = _mm256_and_si256(d, s);
+                _mm256_storeu_si256(dst.as_mut_ptr().add(i) as *mut __m256i, r);
+                i += 4;
+            }
+            while i < dst.len() {
+                dst[i] &= src[i];
+                i += 1;
+            }
+            return;
+        }
+    }
+    dst.iter_mut().zip(src).for_each(|(x, y)| *x &= y);
+}
+
+#[inline(always)]
+fn bitmap_or(dst: &mut [u64], src: &[u64]) {
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx2") {
+        unsafe {
+            let mut i = 0;
+            while i + 4 <= dst.len() {
+                let d = _mm256_loadu_si256(dst.as_ptr().add(i) as *const __m256i);
+                let s = _mm256_loadu_si256(src.as_ptr().add(i) as *const __m256i);
+                let r = _mm256_or_si256(d, s);
+                _mm256_storeu_si256(dst.as_mut_ptr().add(i) as *mut __m256i, r);
+                i += 4;
+            }
+            while i < dst.len() {
+                dst[i] |= src[i];
+                i += 1;
+            }
+            return;
+        }
+    }
+    dst.iter_mut().zip(src).for_each(|(x, y)| *x |= y);
+}
+
+#[inline(always)]
+fn bitmap_not(dst: &mut [u64], src: &[u64]) {
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx2") {
+        unsafe {
+            let mut i = 0;
+            while i + 4 <= dst.len() {
+                let d = _mm256_loadu_si256(dst.as_ptr().add(i) as *const __m256i);
+                let s = _mm256_loadu_si256(src.as_ptr().add(i) as *const __m256i);
+                let r = _mm256_andnot_si256(s, d);
+                _mm256_storeu_si256(dst.as_mut_ptr().add(i) as *mut __m256i, r);
+                i += 4;
+            }
+            while i < dst.len() {
+                dst[i] &= !src[i];
+                i += 1;
+            }
+            return;
+        }
+    }
+    dst.iter_mut().zip(src).for_each(|(x, y)| *x &= !y);
+}
+
+// A running BOOL result: a sorted list while it is small, a bitmap over all documents once large, or a phrase slice.
+enum Set<'a> {
     List(Vec<u32>),
     Bits(Vec<u64>),
+    PhraseSlice(&'a [(u32, u32)]),
 }
 
+#[inline(always)]
 fn has(b: &[u64], x: u32) -> bool {
-    b[x as usize / 64] >> (x % 64) & 1 == 1
+    (b[x as usize / 64] >> (x % 64)) & 1 == 1
 }
 
+#[inline(always)]
 fn set_bits(b: &mut [u64], list: &[u32]) {
     for &x in list {
         b[x as usize / 64] |= 1 << (x % 64);
@@ -651,10 +756,18 @@ fn main() {
                                     }
                                     (1, Set::Bits(mut v)) => match b {
                                         Some(b) => {
-                                            v.iter_mut().zip(b).for_each(|(x, y)| *x &= y);
+                                            bitmap_and(&mut v, b);
                                             Set::Bits(v)
                                         }
-                                        None => Set::List(l.iter().copied().filter(|&x| has(&v, x)).collect()),
+                                        None => {
+                                            let mut out = Vec::with_capacity(l.len());
+                                            for &x in l {
+                                                if has(&v, x) {
+                                                    out.push(x);
+                                                }
+                                            }
+                                            Set::List(out)
+                                        }
                                     },
                                     (2, Set::List(v)) if b.is_none() && v.len() + l.len() <= big_min => Set::List(or(&v, l)),
                                     (2, r) => {
@@ -665,9 +778,10 @@ fn main() {
                                                 set_bits(&mut bv, &v);
                                                 bv
                                             }
+                                            Set::PhraseSlice(_) => unreachable!(),
                                         };
                                         match b {
-                                            Some(b) => v.iter_mut().zip(b).for_each(|(x, y)| *x |= y),
+                                            Some(b) => bitmap_or(&mut v, b),
                                             None => set_bits(&mut v, l),
                                         }
                                         Set::Bits(v)
@@ -681,11 +795,12 @@ fn main() {
                                     }
                                     (_, Set::Bits(mut v)) => {
                                         match b {
-                                            Some(b) => v.iter_mut().zip(b).for_each(|(x, y)| *x &= !y),
-                                            None => l.iter().for_each(|&x| v[x as usize / 64] &= !(1 << (x % 64))),
+                                            Some(b) => bitmap_not(&mut v, b),
+                                            None => l.iter().for_each(|&x| v[x as usize / 64] &= !(1u64 << (x % 64))),
                                         }
                                         Set::Bits(v)
                                     }
+                                    (_, Set::PhraseSlice(_)) => unreachable!(),
                                 };
                             }
                             r
@@ -694,28 +809,57 @@ fn main() {
                             let node = ends[*p as usize];
                             let lo = hits.partition_point(|&(x, _)| x < node);
                             let hi = hits.partition_point(|&(x, _)| x <= node);
-                            Set::List(hits[lo..hi].iter().map(|&(_, doc)| doc).collect())
+                            Set::PhraseSlice(&hits[lo..hi])
                         }
                     };
                     // count, sum of ids, and the ten smallest ids
-                    let (mut count, mut sum, mut first) = (0u64, 0u64, Vec::new());
-                    let mut take = |x: u32| {
-                        count += 1;
-                        sum += x as u64;
-                        if first.len() < 10 {
-                            first.push(x);
-                        }
-                    };
+                    let (count, sum);
+                    let mut first = Vec::with_capacity(10);
                     match &result {
-                        Set::List(v) => v.iter().for_each(|&x| take(x)),
+                        Set::List(v) => {
+                            count = v.len() as u64;
+                            sum = v.iter().map(|&x| x as u64).sum();
+                            first.extend(v.iter().take(10).copied());
+                        }
+                        Set::PhraseSlice(slice) => {
+                            count = slice.len() as u64;
+                            sum = slice.iter().map(|&(_, doc)| doc as u64).sum();
+                            first.extend(slice.iter().take(10).map(|&(_, doc)| doc));
+                        }
                         Set::Bits(v) => {
+                            count = v.iter().map(|&w| w.count_ones() as u64).sum();
                             for (w, &word) in v.iter().enumerate() {
                                 let mut b = word;
                                 while b != 0 {
-                                    take((w * 64) as u32 + b.trailing_zeros());
+                                    first.push((w * 64) as u32 + b.trailing_zeros());
+                                    if first.len() == 10 {
+                                        break;
+                                    }
                                     b &= b - 1;
                                 }
+                                if first.len() == 10 {
+                                    break;
+                                }
                             }
+                            let mut total_sum = 0u64;
+                            for (w, &word) in v.iter().enumerate() {
+                                if word == 0 {
+                                    continue;
+                                }
+                                let base = (w * 64) as u64;
+                                if word == u64::MAX {
+                                    total_sum += base * 64 + 2016;
+                                } else {
+                                    let pop = word.count_ones() as u64;
+                                    total_sum += base * pop;
+                                    let mut b = word;
+                                    while b != 0 {
+                                        total_sum += b.trailing_zeros() as u64;
+                                        b &= b - 1;
+                                    }
+                                }
+                            }
+                            sum = total_sum;
                         }
                     }
                     let mut o = Vec::new();
@@ -878,5 +1022,99 @@ mod tests {
 
         let s3 = ac.step(s2, 3);
         assert_eq!(s3, ends[1]); // matches "b c d" via fail transition!
+    }
+
+    #[test]
+    fn test_boolean_engine_set_operations() {
+        let a = vec![1, 5, 10, 20, 25, 30];
+        let b = vec![5, 15, 20, 35];
+        assert_eq!(and(&a, &b), vec![5, 20]);
+        assert_eq!(or(&a, &b), vec![1, 5, 10, 15, 20, 25, 30, 35]);
+        assert_eq!(not(&a, &b), vec![1, 10, 25, 30]);
+
+        // Left to right: (a OR b) NOT a
+        let a_or_b = or(&a, &b);
+        let res = not(&a_or_b, &a);
+        assert_eq!(res, vec![15, 35]);
+    }
+
+    #[test]
+    fn test_bitmap_operations_and_popcount() {
+        let mut b1 = vec![0u64; 8];
+        let mut b2 = vec![0u64; 8];
+
+        set_bits(&mut b1, &[0, 63, 64, 127, 200]);
+        set_bits(&mut b2, &[63, 127, 300]);
+
+        let mut b_and = b1.clone();
+        bitmap_and(&mut b_and, &b2);
+        assert_eq!(b_and.iter().map(|&w| w.count_ones()).sum::<u32>(), 2);
+        assert!(has(&b_and, 63));
+        assert!(has(&b_and, 127));
+        assert!(!has(&b_and, 0));
+
+        let mut b_or = b1.clone();
+        bitmap_or(&mut b_or, &b2);
+        assert_eq!(b_or.iter().map(|&w| w.count_ones()).sum::<u32>(), 6);
+
+        let mut b_not = b1.clone();
+        bitmap_not(&mut b_not, &b2);
+        assert_eq!(b_not.iter().map(|&w| w.count_ones()).sum::<u32>(), 3);
+        assert!(has(&b_not, 0));
+        assert!(has(&b_not, 64));
+        assert!(has(&b_not, 200));
+        assert!(!has(&b_not, 63));
+    }
+
+    #[test]
+    fn test_count_sum_first_exactness() {
+        // Test list with >10 items: 10..25 (15 items)
+        let list: Vec<u32> = (10..25).collect();
+        let expected_count = 15u64;
+        let expected_sum: u64 = (10..25).map(|x| x as u64).sum();
+        let expected_first: Vec<u32> = (10..20).collect();
+
+        // Evaluate via bitmap
+        let mut b = vec![0u64; 4];
+        set_bits(&mut b, &list);
+
+        let b_count: u64 = b.iter().map(|&w| w.count_ones() as u64).sum();
+        assert_eq!(b_count, expected_count);
+
+        let mut b_first = Vec::new();
+        for (w, &word) in b.iter().enumerate() {
+            let mut val = word;
+            while val != 0 {
+                b_first.push((w * 64) as u32 + val.trailing_zeros());
+                if b_first.len() == 10 {
+                    break;
+                }
+                val &= val - 1;
+            }
+            if b_first.len() == 10 {
+                break;
+            }
+        }
+        assert_eq!(b_first, expected_first);
+
+        let mut b_sum = 0u64;
+        for (w, &word) in b.iter().enumerate() {
+            if word == 0 {
+                continue;
+            }
+            let base = (w * 64) as u64;
+            if word == u64::MAX {
+                b_sum += base * 64 + 2016;
+            } else {
+                let pop = word.count_ones() as u64;
+                b_sum += base * pop;
+                let mut val = word;
+                while val != 0 {
+                    b_sum += val.trailing_zeros() as u64;
+                    val &= val - 1;
+                }
+            }
+        }
+        assert_eq!(b_sum, expected_sum);
     }
 }
