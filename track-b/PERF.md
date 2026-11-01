@@ -12,7 +12,7 @@ Every step from the reference to your final version, each with the live-board ru
 | Version | Phase | Runtime | Peak RSS | SHA-256 | Notes |
 |---|---|---:|---:|---|---|
 | Baseline | Original | 524.5 ms | 311.1 MB | Verified (`f86973c2...`) | Initial Rust baseline (run-1e45bc9e0c74, K=11.5155, 575 lines, D=1) |
-| Phase 1 | Memory | TBD | TBD | TBD | Remove global `pairs` Vec, thread-local direct bitmaps/sparse arenas |
+| Phase 1 | Memory | 184.7 ms (sample) | 47.1 MB (sample) | Verified (`eeeec1e9...`) | Removed global `pairs` Vec; thread-local postings; dense terms stored only as bitmaps; code reduced by 15 lines (560 lines) |
 | Phase 2 | Tokenizer | TBD | TBD | TBD | AVX2 SIMD scanning & delimiter detection |
 | Phase 3 | Prefix | TBD | TBD | TBD | 64K query-prefix lookup / fast rejection |
 | Phase 4 | AC | TBD | TBD | TBD | Direct array root-state transition in Aho-Corasick |
@@ -33,6 +33,14 @@ Every step from the reference to your final version, each with the live-board ru
 4. **Correctness Status:**
    - Byte-for-byte verified against official spec worked example (18 queries, 5 docs).
    - Official full-scale dataset SHA-256 confirmed as `f86973c210228141bcb6f1f1b10188ad2a9b65f71e7cd7cf4590b38de4e80927`.
+
+## Phase 1 Findings & Results
+
+- **Global Intermediate Pairs Removed:** `part.pairs: Vec<(u32, u32)>` completely eliminated. Document IDs are now accumulated per term in thread-local vectors.
+- **Dense/Sparse Segregation:** Terms exceeding `big_min` are converted directly into bitmaps. They are never stored in `postings`, eliminating ~25M integer entries from the posting buffer.
+- **Natural Ordering Preserved:** Thread-local lists are concatenated in partition order, preserving monotonic document IDs without sorting.
+- **Differential Correctness:** Output SHA-256 matches the expected checksum on both the spec worked example and the official seed-1 sample dataset (`eeeec1e9319da98a6f3c664c78f93e7078fd603c25c2bb3027174e81e3638a8f`).
+- **Code Size:** Reduced from 575 to 560 lines (`scc` line count decreases, improving the $S$ ratio).
 
 ## Notes
 

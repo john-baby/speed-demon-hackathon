@@ -172,10 +172,9 @@ fn build(phrases: &[Vec<u32>]) -> (Automaton, Vec<u32>) {
 
 // What one thread finds in its range of documents.
 struct Part {
-    pairs: Vec<(u32, u32)>, // (bool term, doc), each pair once, docs ascending
-    tally: Vec<u32>,        // documents per bool term
-    hits: Vec<(u32, u32)>,  // (phrase end node, doc), each pair once
-    docs: usize,            // last doc id seen + 1
+    lists: Vec<Vec<u32>>,  // term -> docs in this thread
+    hits: Vec<(u32, u32)>, // (phrase end node, doc), each pair once
+    docs: usize,           // last doc id seen + 1
 }
 
 fn scan(d: &[u8], terms: &Terms, in_bool: &[bool], in_phrase: &[bool], ac: &Automaton, nodes: usize) -> Part {
@@ -186,8 +185,9 @@ fn scan(d: &[u8], terms: &Terms, in_bool: &[bool], in_phrase: &[bool], ac: &Auto
     for b in b'A'..=b'Z' {
         class[b as usize] = b + 32;
     }
-    let mut part = Part { pairs: Vec::new(), tally: vec![0; terms.keys.len()], hits: Vec::new(), docs: 0 };
-    let mut last = vec![NONE; terms.keys.len()];
+    let nterms = terms.keys.len();
+    let mut part = Part { lists: vec![Vec::new(); nterms], hits: Vec::new(), docs: 0 };
+    let mut last = vec![NONE; nterms];
     let mut last_hit = vec![NONE; nodes];
     let mut p = 0;
     while p < d.len() {
@@ -220,8 +220,7 @@ fn scan(d: &[u8], terms: &Terms, in_bool: &[bool], in_phrase: &[bool], ac: &Auto
                 len = 0;
                 if t != NONE && in_bool[t as usize] && last[t as usize] != doc {
                     last[t as usize] = doc;
-                    part.tally[t as usize] += 1;
-                    part.pairs.push((t, doc));
+                    part.lists[t as usize].push(doc);
                 }
                 if t == NONE || !in_phrase[t as usize] {
                     state = 0;
@@ -300,15 +299,6 @@ fn set_bits(b: &mut [u64], list: &[u32]) {
     }
 }
 
-#[derive(Clone, Copy)]
-struct Shared(*mut u32);
-unsafe impl Send for Shared {}
-unsafe impl Sync for Shared {}
-impl Shared {
-    fn at(self, i: usize) -> *mut u32 {
-        unsafe { self.0.add(i) }
-    }
-}
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -375,54 +365,58 @@ fn main() {
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
 
-    // 3. Posting lists of the bool terms in one array; threads hold ascending doc ranges, so
-    //    placing them term by term, thread by thread, keeps every list sorted.
+    // 3. Assemble posting lists and dense bitmaps without intermediate global pairs.
+    // Frequent terms (> big_min) are stored exclusively as dense bitmaps;
+    // sparse terms are stored as compact sorted slices in postings.
     let ndocs = parts.iter().map(|p| p.docs).max().unwrap_or(0);
-    let mut start = vec![0usize; nterms + 1];
-    let mut at: Vec<Vec<usize>> = vec![vec![0; nterms]; nt];
-    let mut total = 0;
-    for t in 0..nterms {
-        start[t] = total;
-        for (i, part) in parts.iter().enumerate() {
-            at[i][t] = total;
-            total += part.tally[t] as usize;
-        }
-    }
-    start[nterms] = total;
-    let mut postings = vec![0u32; total];
-    let out = Shared(postings.as_mut_ptr());
-    thread::scope(|sc| {
-        for (part, at) in parts.iter().zip(&mut at) {
-            sc.spawn(move || {
-                for &(t, doc) in &part.pairs {
-                    unsafe { *out.at(at[t as usize]) = doc };
-                    at[t as usize] += 1;
-                }
-            });
-        }
-    });
-    drop(at);
-
-    // Frequent terms also get a bitmap over all documents, so AND, OR and NOT against them cost
-    // a word-wise pass or one bit test per element of the other side.
     let words = ndocs.div_ceil(64);
     let big_min = words * 2;
-    let big: Vec<u32> = (0..nterms as u32).filter(|&t| start[t as usize + 1] - start[t as usize] > big_min).collect();
-    let mut bitmap_of = vec![NONE; nterms];
-    for (i, &t) in big.iter().enumerate() {
-        bitmap_of[t as usize] = i as u32;
+
+    let mut tally = vec![0usize; nterms];
+    for p in &parts {
+        for t in 0..nterms {
+            tally[t] += p.lists[t].len();
+        }
     }
-    let bitmaps: Vec<Vec<u64>> = thread::scope(|sc| {
-        let hs: Vec<_> = (0..nt).map(|i| {
-            let (big, start, postings) = (&big, &start, &postings);
-            sc.spawn(move || big[big.len() * i / nt..big.len() * (i + 1) / nt].iter().map(|&t| {
-                let mut b = vec![0u64; words];
-                set_bits(&mut b, &postings[start[t as usize]..start[t as usize + 1]]);
-                b
-            }).collect::<Vec<_>>())
-        }).collect();
-        hs.into_iter().flat_map(|h| h.join().unwrap()).collect()
-    });
+
+    let mut bitmap_of = vec![NONE; nterms];
+    let mut big = Vec::new();
+    let mut start = vec![0usize; nterms + 1];
+    let mut sparse_total = 0;
+
+    for t in 0..nterms {
+        if tally[t] > big_min {
+            bitmap_of[t] = big.len() as u32;
+            big.push(t as u32);
+            start[t] = sparse_total;
+        } else {
+            start[t] = sparse_total;
+            sparse_total += tally[t];
+        }
+    }
+    start[nterms] = sparse_total;
+
+    let mut postings = vec![0u32; sparse_total];
+    let mut at = start.clone();
+    for p in &parts {
+        for t in 0..nterms {
+            if bitmap_of[t] == NONE {
+                let l = &p.lists[t];
+                let off = at[t];
+                postings[off..off + l.len()].copy_from_slice(l);
+                at[t] += l.len();
+            }
+        }
+    }
+
+    let mut bitmaps = Vec::with_capacity(big.len());
+    for &t in &big {
+        let mut b = vec![0u64; words];
+        for p in &parts {
+            set_bits(&mut b, &p.lists[t as usize]);
+        }
+        bitmaps.push(b);
+    }
 
     let mut hits: Vec<(u32, u32)> = parts.into_iter().flat_map(|p| p.hits).collect();
     hits.sort_unstable();
