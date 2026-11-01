@@ -13,7 +13,7 @@ Every step from the reference to your final version, each with the live-board ru
 |---|---|---:|---:|---|---|
 | Baseline | Original | 524.5 ms | 311.1 MB | Verified (`f86973c2...`) | Initial Rust baseline (run-1e45bc9e0c74, K=11.5155, 575 lines, D=1) |
 | Phase 1 | Memory | 184.7 ms (sample) | 47.1 MB (sample) | Verified (`eeeec1e9...`) | Removed global `pairs` Vec; thread-local postings; dense terms stored only as bitmaps; code reduced by 15 lines (560 lines) |
-| Phase 2 | Tokenizer | TBD | TBD | TBD | AVX2 SIMD scanning & delimiter detection |
+| Phase 2 | Tokenizer | 175.9 ms (sample) | 46.9 MB (sample) | Verified (`eeeec1e9...`) | AVX2 SIMD scanning, 32-byte block processing, SIMD case-folding & bitmask delimiter skipping |
 | Phase 3 | Prefix | TBD | TBD | TBD | 64K query-prefix lookup / fast rejection |
 | Phase 4 | AC | TBD | TBD | TBD | Direct array root-state transition in Aho-Corasick |
 | Phase 5 | Boolean | TBD | TBD | TBD | SIMD bitwise ops and hardware popcount |
@@ -41,6 +41,14 @@ Every step from the reference to your final version, each with the live-board ru
 - **Natural Ordering Preserved:** Thread-local lists are concatenated in partition order, preserving monotonic document IDs without sorting.
 - **Differential Correctness:** Output SHA-256 matches the expected checksum on both the spec worked example and the official seed-1 sample dataset (`eeeec1e9319da98a6f3c664c78f93e7078fd603c25c2bb3027174e81e3638a8f`).
 - **Code Size:** Reduced from 575 to 560 lines (`scc` line count decreases, improving the $S$ ratio).
+
+## Phase 2 Findings & Results
+
+- **AVX2 SIMD Block Classification:** Implemented 32-byte chunk processing with `_mm256_loadu_si256`. Token ranges (`0..9`, `A..Z`, `a..z`) are detected via SIMD vector comparisons.
+- **Vectorized Lowercasing:** Uppercase ASCII letters (`A..Z`) are converted to lowercase in SIMD (`_mm256_add_epi8` with masked $+32$) before token extraction.
+- **Fast Delimiter Skipping:** Consecutive separators are skipped in single-cycle operations using bitmask manipulation and hardware trailing-zero counts (`tzcnt`).
+- **Safe Fallback & Boundary Handling:** Full compatibility maintained across document line boundaries, with scalar tail loops handling trailing sub-32-byte chunks and non-AVX2 hardware via `is_x86_feature_detected!("avx2")`.
+- **Differential Correctness:** Output SHA-256 matches byte-for-byte on both the spec worked example and the official seed-1 sample dataset (`eeeec1e9319da98a6f3c664c78f93e7078fd603c25c2bb3027174e81e3638a8f`).
 
 ## Notes
 

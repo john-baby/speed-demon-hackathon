@@ -3,6 +3,9 @@ use std::io::Write;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::thread;
 
+#[cfg(target_arch = "x86_64")]
+use std::arch::x86_64::*;
+
 // Map the input read-only; the host has it in the page cache, so it is not charged to us.
 #[cfg(unix)]
 fn load(path: &str) -> &'static [u8] {
@@ -177,14 +180,170 @@ struct Part {
     docs: usize,           // last doc id seen + 1
 }
 
-fn scan(d: &[u8], terms: &Terms, in_bool: &[bool], in_phrase: &[bool], ac: &Automaton, nodes: usize) -> Part {
-    let mut class = [0u8; 256];
-    for b in (b'a'..=b'z').chain(b'0'..=b'9') {
-        class[b as usize] = b;
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn classify_32(ptr: *const u8) -> (u32, [u8; 32]) {
+    let v = _mm256_loadu_si256(ptr as *const __m256i);
+    let is_digit = _mm256_and_si256(
+        _mm256_cmpgt_epi8(v, _mm256_set1_epi8(47)),
+        _mm256_cmpgt_epi8(_mm256_set1_epi8(58), v),
+    );
+    let is_upper = _mm256_and_si256(
+        _mm256_cmpgt_epi8(v, _mm256_set1_epi8(64)),
+        _mm256_cmpgt_epi8(_mm256_set1_epi8(91), v),
+    );
+    let is_lower = _mm256_and_si256(
+        _mm256_cmpgt_epi8(v, _mm256_set1_epi8(96)),
+        _mm256_cmpgt_epi8(_mm256_set1_epi8(123), v),
+    );
+    let is_token = _mm256_or_si256(is_digit, _mm256_or_si256(is_upper, is_lower));
+    let mask = _mm256_movemask_epi8(is_token) as u32;
+    let lower_v = _mm256_add_epi8(v, _mm256_and_si256(is_upper, _mm256_set1_epi8(32)));
+    let mut out = [0u8; 32];
+    _mm256_storeu_si256(out.as_mut_ptr() as *mut __m256i, lower_v);
+    (mask, out)
+}
+
+#[inline(always)]
+fn on_token_action(
+    key: &[u8; 32],
+    len: usize,
+    doc: u32,
+    terms: &Terms,
+    in_bool: &[bool],
+    in_phrase: &[bool],
+    ac: &Automaton,
+    state: &mut u32,
+    part: &mut Part,
+    last: &mut [u32],
+    last_hit: &mut [u32],
+) {
+    let t = if len <= 32 { terms.find(key).1 } else { NONE };
+    if t != NONE && in_bool[t as usize] && last[t as usize] != doc {
+        last[t as usize] = doc;
+        part.lists[t as usize].push(doc);
     }
-    for b in b'A'..=b'Z' {
-        class[b as usize] = b + 32;
+    if t == NONE || !in_phrase[t as usize] {
+        *state = 0;
+    } else {
+        *state = ac.step(*state, t);
+        let mut x = ac.out[*state as usize];
+        while x != NONE {
+            if last_hit[x as usize] != doc {
+                last_hit[x as usize] = doc;
+                part.hits.push((x, doc));
+            }
+            x = ac.out[ac.fail[x as usize] as usize];
+        }
     }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn scan_doc_avx2(
+    text: &[u8],
+    doc: u32,
+    terms: &Terms,
+    in_bool: &[bool],
+    in_phrase: &[bool],
+    ac: &Automaton,
+    part: &mut Part,
+    last: &mut [u32],
+    last_hit: &mut [u32],
+) {
+    let mut state = 0u32;
+    let mut cur = [0u8; 32];
+    let mut cur_len = 0usize;
+
+    let mut p = 0;
+    while p + 32 <= text.len() {
+        let (mask, out) = classify_32(text.as_ptr().add(p));
+        let mut off = 0;
+        while off < 32 {
+            let bit = (mask >> off) & 1;
+            if bit != 0 {
+                let sub = mask >> off;
+                let len = (!sub).trailing_zeros().min(32 - off as u32) as usize;
+                let take = len.min(32 - cur_len.min(32));
+                cur[cur_len.min(32)..cur_len.min(32) + take].copy_from_slice(&out[off..off + take]);
+                cur_len += len;
+                off += len;
+            } else {
+                if cur_len > 0 {
+                    on_token_action(&cur, cur_len, doc, terms, in_bool, in_phrase, ac, &mut state, part, last, last_hit);
+                    cur = [0; 32];
+                    cur_len = 0;
+                }
+                let sub = mask >> off;
+                let sep = sub.trailing_zeros().min(32 - off as u32) as usize;
+                off += sep.max(1);
+            }
+        }
+        p += 32;
+    }
+
+    while p < text.len() {
+        let b = text[p];
+        p += 1;
+        let c = match b {
+            b'a'..=b'z' | b'0'..=b'9' => b,
+            b'A'..=b'Z' => b + 32,
+            _ => 0,
+        };
+        if c != 0 {
+            if cur_len < 32 {
+                cur[cur_len] = c;
+            }
+            cur_len += 1;
+        } else if cur_len > 0 {
+            on_token_action(&cur, cur_len, doc, terms, in_bool, in_phrase, ac, &mut state, part, last, last_hit);
+            cur = [0; 32];
+            cur_len = 0;
+        }
+    }
+
+    if cur_len > 0 {
+        on_token_action(&cur, cur_len, doc, terms, in_bool, in_phrase, ac, &mut state, part, last, last_hit);
+    }
+}
+
+fn scan_doc_scalar(
+    text: &[u8],
+    doc: u32,
+    terms: &Terms,
+    in_bool: &[bool],
+    in_phrase: &[bool],
+    ac: &Automaton,
+    part: &mut Part,
+    last: &mut [u32],
+    last_hit: &mut [u32],
+) {
+    let mut state = 0u32;
+    let mut key = [0u8; 32];
+    let mut len = 0usize;
+    for &b in text {
+        let c = match b {
+            b'a'..=b'z' | b'0'..=b'9' => b,
+            b'A'..=b'Z' => b + 32,
+            _ => 0,
+        };
+        if c != 0 {
+            if len < 32 {
+                key[len] = c;
+            }
+            len += 1;
+        } else if len > 0 {
+            on_token_action(&key, len, doc, terms, in_bool, in_phrase, ac, &mut state, part, last, last_hit);
+            key = [0; 32];
+            len = 0;
+        }
+    }
+    if len > 0 {
+        on_token_action(&key, len, doc, terms, in_bool, in_phrase, ac, &mut state, part, last, last_hit);
+    }
+}
+
+fn scan(d: &[u8], terms: &Terms, in_bool: &[bool], in_phrase: &[bool], ac: &Automaton, nodes: usize, use_avx2: bool) -> Part {
     let nterms = terms.keys.len();
     let mut part = Part { lists: vec![Vec::new(); nterms], hits: Vec::new(), docs: 0 };
     let mut last = vec![NONE; nterms];
@@ -192,54 +351,31 @@ fn scan(d: &[u8], terms: &Terms, in_bool: &[bool], in_phrase: &[bool], ac: &Auto
     let mut p = 0;
     while p < d.len() {
         let mut doc = 0u32;
-        while d[p] != b'\t' {
+        while p < d.len() && d[p] != b'\t' {
             doc = doc * 10 + (d[p] - b'0') as u32;
             p += 1;
         }
+        if p >= d.len() {
+            break;
+        }
         p += 1;
         part.docs = doc as usize + 1;
-        let mut state = 0;
-        let mut key = [0u8; 32];
-        let mut len = 0;
-        loop {
-            let b = d[p];
-            p += 1;
-            let c = class[b as usize];
-            if c != 0 {
-                if len < 33 {
-                    if len < 32 {
-                        key[len] = c;
-                    }
-                    len += 1;
-                }
-                continue;
+        let nl = match d[p..].iter().position(|&b| b == b'\n') {
+            Some(i) => p + i,
+            None => d.len(),
+        };
+        let text = &d[p..nl];
+        p = nl + 1;
+
+        #[cfg(target_arch = "x86_64")]
+        if use_avx2 {
+            unsafe {
+                scan_doc_avx2(text, doc, terms, in_bool, in_phrase, ac, &mut part, &mut last, &mut last_hit);
             }
-            if len > 0 {
-                let t = if len <= 32 { terms.find(&key).1 } else { NONE };
-                key = [0; 32];
-                len = 0;
-                if t != NONE && in_bool[t as usize] && last[t as usize] != doc {
-                    last[t as usize] = doc;
-                    part.lists[t as usize].push(doc);
-                }
-                if t == NONE || !in_phrase[t as usize] {
-                    state = 0;
-                } else {
-                    state = ac.step(state, t);
-                    let mut x = ac.out[state as usize];
-                    while x != NONE {
-                        if last_hit[x as usize] != doc {
-                            last_hit[x as usize] = doc;
-                            part.hits.push((x, doc));
-                        }
-                        x = ac.out[ac.fail[x as usize] as usize];
-                    }
-                }
-            }
-            if b == b'\n' {
-                break;
-            }
+            continue;
         }
+
+        scan_doc_scalar(text, doc, terms, in_bool, in_phrase, ac, &mut part, &mut last, &mut last_hit);
     }
     part
 }
@@ -357,10 +493,11 @@ fn main() {
         bounds.push(x);
     }
     bounds.push(d.len());
+    let use_avx2 = is_x86_feature_detected!("avx2");
     let parts: Vec<Part> = thread::scope(|sc| {
         let hs: Vec<_> = (0..nt).map(|i| {
             let (part, terms, in_bool, in_phrase, ac) = (&d[bounds[i]..bounds[i + 1]], &terms, &in_bool, &in_phrase, &ac);
-            sc.spawn(move || scan(part, terms, in_bool, in_phrase, ac, nodes))
+            sc.spawn(move || scan(part, terms, in_bool, in_phrase, ac, nodes, use_avx2))
         }).collect();
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
