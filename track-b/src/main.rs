@@ -39,6 +39,45 @@ fn hash(k: &Key) -> u64 {
     h ^ h >> 29
 }
 
+// Compact prefix filter (65,536 bits = 8 KB bitmap for 2-byte prefixes, 256 bits = 32 B for 1-byte terms).
+struct PrefixFilter {
+    table: [u64; 1024],
+    len1: [u64; 4],
+}
+
+impl PrefixFilter {
+    fn new() -> Self {
+        Self {
+            table: [0u64; 1024],
+            len1: [0u64; 4],
+        }
+    }
+
+    #[inline]
+    fn insert(&mut self, word: &[u8]) {
+        if word.len() == 1 {
+            let b = word[0] as usize;
+            self.len1[b / 64] |= 1u64 << (b % 64);
+        } else if word.len() >= 2 {
+            let p = ((word[0] as usize) << 8) | (word[1] as usize);
+            self.table[p / 64] |= 1u64 << (p % 64);
+        }
+    }
+
+    #[inline(always)]
+    fn may_contain(&self, key: &[u8; 32], len: usize) -> bool {
+        if len == 1 {
+            let b = key[0] as usize;
+            (self.len1[b / 64] & (1u64 << (b % 64))) != 0
+        } else if len >= 2 {
+            let p = ((key[0] as usize) << 8) | (key[1] as usize);
+            (self.table[p / 64] & (1u64 << (p % 64))) != 0
+        } else {
+            false
+        }
+    }
+}
+
 // Open-addressing map from a u64 key (never u64::MAX) to a u32, sized for `n` entries.
 struct Map {
     keys: Vec<u64>,
@@ -76,6 +115,7 @@ impl Map {
 struct Terms {
     keys: Vec<Key>,
     slots: Vec<u32>, // id + 1, 0 = empty
+    filter: PrefixFilter,
 }
 
 impl Terms {
@@ -92,6 +132,7 @@ impl Terms {
     }
 
     fn id(&mut self, word: &[u8]) -> u32 {
+        self.filter.insert(word);
         let mut k = [0u8; 32];
         k[..word.len()].copy_from_slice(word);
         let (i, id) = self.find(&k);
@@ -218,12 +259,20 @@ fn on_token_action(
     last: &mut [u32],
     last_hit: &mut [u32],
 ) {
-    let t = if len <= 32 { terms.find(key).1 } else { NONE };
-    if t != NONE && in_bool[t as usize] && last[t as usize] != doc {
+    if len > 32 || !terms.filter.may_contain(key, len) {
+        *state = 0;
+        return;
+    }
+    let (_, t) = terms.find(key);
+    if t == NONE {
+        *state = 0;
+        return;
+    }
+    if in_bool[t as usize] && last[t as usize] != doc {
         last[t as usize] = doc;
         part.lists[t as usize].push(doc);
     }
-    if t == NONE || !in_phrase[t as usize] {
+    if !in_phrase[t as usize] {
         *state = 0;
     } else {
         *state = ac.step(*state, t);
@@ -444,7 +493,7 @@ fn main() {
 
     // 1. Queries first: number their terms and build the phrase automaton.
     let qtext = std::fs::read(format!("{data_dir}/queries.txt")).unwrap();
-    let mut terms = Terms { keys: Vec::new(), slots: vec![0; 1 << 20] };
+    let mut terms = Terms { keys: Vec::new(), slots: vec![0; 1 << 20], filter: PrefixFilter::new() };
     let mut queries = Vec::new();
     let mut phrases = Vec::new();
     for line in qtext.split(|&b| b == b'\n').filter(|l| !l.is_empty()) {
@@ -674,4 +723,79 @@ fn main() {
         out[i] = o;
     }
     std::fs::write(format!("{out_dir}/results.txt"), out.concat()).unwrap();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_prefix_filter_basic() {
+        let mut filter = PrefixFilter::new();
+        filter.insert(b"apple");
+        filter.insert(b"banana");
+        filter.insert(b"c");
+        filter.insert(b"123");
+
+        let make_key = |s: &[u8]| {
+            let mut k = [0u8; 32];
+            k[..s.len()].copy_from_slice(s);
+            k
+        };
+
+        // All inserted terms must pass
+        assert!(filter.may_contain(&make_key(b"apple"), 5));
+        assert!(filter.may_contain(&make_key(b"banana"), 6));
+        assert!(filter.may_contain(&make_key(b"c"), 1));
+        assert!(filter.may_contain(&make_key(b"123"), 3));
+
+        // Other terms sharing the 2-byte prefix pass filter (admissible filter)
+        assert!(filter.may_contain(&make_key(b"apricot"), 7));
+        assert!(filter.may_contain(&make_key(b"band"), 4));
+
+        // Terms with uninserted prefixes must be rejected
+        assert!(!filter.may_contain(&make_key(b"zebra"), 5));
+        assert!(!filter.may_contain(&make_key(b"orange"), 6));
+        assert!(!filter.may_contain(&make_key(b"d"), 1));
+        assert!(!filter.may_contain(&make_key(b"999"), 3));
+
+        // Empty and len 0
+        assert!(!filter.may_contain(&make_key(b""), 0));
+        assert!(!filter.may_contain(&make_key(b"a"), 0));
+    }
+
+    #[test]
+    fn test_prefix_filter_all_query_terms_pass() {
+        let mut terms = Terms {
+            keys: Vec::new(),
+            slots: vec![0; 1024],
+            filter: PrefixFilter::new(),
+        };
+
+        let sample_words: &[&[u8]] = &[
+            b"a", b"1", b"in", b"the", b"query", b"search", b"demon",
+            b"optimization", b"aho", b"corasick", b"bitmap", b"vector",
+        ];
+
+        for &w in sample_words {
+            terms.id(w);
+        }
+
+        for &w in sample_words {
+            let mut k = [0u8; 32];
+            k[..w.len()].copy_from_slice(w);
+            assert!(
+                terms.filter.may_contain(&k, w.len()),
+                "Query term {:?} must pass prefix filter",
+                std::str::from_utf8(w).unwrap()
+            );
+            let (_, id) = terms.find(&k);
+            assert_ne!(id, NONE, "Query term must be found in terms");
+        }
+
+        // Check non-existent term rejection
+        let mut k = [0u8; 32];
+        k[..5].copy_from_slice(b"zztop");
+        assert!(!terms.filter.may_contain(&k, 5));
+    }
 }
