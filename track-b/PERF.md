@@ -17,7 +17,7 @@ Every step from the reference to your final version, each with the live-board ru
 | Phase 3 | Prefix | 172.5 ms (sample) | 46.9 MB (sample) | Verified (`eeeec1e9...`) | 64K query-prefix bitmap lookup / fast rejection of non-query tokens; 8 KB L1-resident table |
 | Phase 4 | AC | 165.4 ms (sample) | 46.8 MB (sample) | Verified (`eeeec1e9...`) | O(1) direct root transitions; flat sorted non-root edge arrays; struct Map completely removed (-32 lines) |
 | Phase 5 | Boolean | 164.5 ms (sample) | 46.8 MB (sample) | Verified (`eeeec1e9...`) | AVX2 vector bitwise ops, hardware popcnt, early exit on 10 IDs, zero-alloc phrase result slices |
-| Phase 6 | Output | TBD | TBD | TBD | Preallocated buffer and branchless itoa |
+| Phase 6 | Output | 161.0 ms (sample) | 46.7 MB (sample) | Verified (`eeeec1e9...`) | Branchless 2-digit lookup itoa, preallocated line capacity, single-pass contiguous output buffer |
 
 ## Phase 0 Baseline Analysis & Identified Bottlenecks
 
@@ -75,6 +75,15 @@ Every step from the reference to your final version, each with the live-board ru
 - **Zero-Allocation Phrase Slices:** Phrase query evaluation borrows directly from `hits` via `Set::PhraseSlice(&hits[lo..hi])`, eliminating ~19,000 intermediate `Vec<u32>` heap allocations.
 - **Two-Pointer Linear Scans:** Sparse posting list intersections and differences use branch-efficient two-pointer scans when list lengths are within 16x, with galloping fallback for highly asymmetrical list pairs.
 - **Unit & Differential Testing:** All 8 unit tests pass. Output checksum on the official seed-1 sample dataset verified byte-for-byte (`eeeec1e9319da98a6f3c664c78f93e7078fd603c25c2bb3027174e81e3638a8f`) and on the 18 spec worked example queries.
+
+## Phase 6 Findings & Results
+
+- **Branchless Lookup `itoa` Formatting:** Replaced `std::io::Write` trait calls and `write!` macro dynamic parsing with a 2-digit lookup table (`DIGITS`), processing numbers 2 digits per iteration with zero division by 10.
+- **Capacity-Preallocated Lines:** Each formatted line preallocates `32 + 8 * first.len()`, eliminating vector reallocation during line construction.
+- **Single-Pass Output Assembly:** The final output buffer calculates exact `total_len` and allocates `final_out` in one contiguous slice, removing multi-pass `concat` reallocation.
+- **Zero-Match Query Handling:** Correctly handles zero-match queries as `0 0\n` per specification.
+- **Unit & Differential Testing:** 11 unit tests pass. SHA-256 verified byte-for-byte on the official sample seed-1 dataset (`eeeec1e9319da98a6f3c664c78f93e7078fd603c25c2bb3027174e81e3638a8f`) and spec worked example.
+- **Benchmark Improvement:** Runtime dropped to a fastest run of **161.0 ms** on sample data.
 
 ## Notes
 

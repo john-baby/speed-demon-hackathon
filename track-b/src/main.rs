@@ -1,5 +1,4 @@
 // Speed Demon 2026, Track B (Index). See README.md for the approach.
-use std::io::Write;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::thread;
 
@@ -602,6 +601,58 @@ fn set_bits(b: &mut [u64], list: &[u32]) {
     }
 }
 
+static DIGITS: &[u8; 200] = b"\
+00010203040506070809\
+10111213141516171819\
+20212223242526272829\
+30313233343536373839\
+40414243444546474849\
+50515253545556575859\
+60616263646566676869\
+70717273747576777879\
+80818283848586878889\
+90919293949596979899";
+
+#[inline(always)]
+fn write_u64(buf: &mut Vec<u8>, mut n: u64) {
+    if n == 0 {
+        buf.push(b'0');
+        return;
+    }
+    let mut tmp = [0u8; 20];
+    let mut i = 20;
+    while n >= 100 {
+        let rem = (n % 100) as usize * 2;
+        n /= 100;
+        i -= 2;
+        tmp[i] = DIGITS[rem];
+        tmp[i + 1] = DIGITS[rem + 1];
+    }
+    if n >= 10 {
+        let rem = n as usize * 2;
+        i -= 2;
+        tmp[i] = DIGITS[rem];
+        tmp[i + 1] = DIGITS[rem + 1];
+    } else {
+        i -= 1;
+        tmp[i] = b'0' + n as u8;
+    }
+    buf.extend_from_slice(&tmp[i..]);
+}
+
+#[inline(always)]
+fn format_line(count: u64, sum: u64, first: &[u32]) -> Vec<u8> {
+    let mut o = Vec::with_capacity(32 + first.len() * 8);
+    write_u64(&mut o, count);
+    o.push(b' ');
+    write_u64(&mut o, sum);
+    for &x in first {
+        o.push(b' ');
+        write_u64(&mut o, x as u64);
+    }
+    o.push(b'\n');
+    o
+}
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -862,13 +913,7 @@ fn main() {
                             sum = total_sum;
                         }
                     }
-                    let mut o = Vec::new();
-                    write!(o, "{count} {sum}").unwrap();
-                    for x in &first {
-                        write!(o, " {x}").unwrap();
-                    }
-                    o.push(b'\n');
-                    done.push((i, o));
+                    done.push((i, format_line(count, sum, &first)));
                 }
             })
         }).collect();
@@ -879,7 +924,12 @@ fn main() {
     for (i, o) in lines.into_iter().flatten() {
         out[i] = o;
     }
-    std::fs::write(format!("{out_dir}/results.txt"), out.concat()).unwrap();
+    let total_len: usize = out.iter().map(|l| l.len()).sum();
+    let mut final_out = Vec::with_capacity(total_len);
+    for l in out {
+        final_out.extend_from_slice(&l);
+    }
+    std::fs::write(format!("{out_dir}/results.txt"), final_out).unwrap();
 }
 
 #[cfg(test)]
@@ -1116,5 +1166,30 @@ mod tests {
             }
         }
         assert_eq!(b_sum, expected_sum);
+    }
+
+    #[test]
+    fn test_format_line_zero() {
+        assert_eq!(format_line(0, 0, &[]), b"0 0\n");
+    }
+
+    #[test]
+    fn test_format_line_with_ids() {
+        assert_eq!(format_line(3, 4, &[0, 1, 3]), b"3 4 0 1 3\n");
+        assert_eq!(
+            format_line(15, 12345678901234, &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]),
+            b"15 12345678901234 1 2 3 4 5 6 7 8 9 10\n"
+        );
+    }
+
+    #[test]
+    fn test_write_u64_various() {
+        let mut buf = Vec::new();
+        let nums = [0, 1, 9, 10, 11, 99, 100, 101, 999, 1000, 12345, 123456789, u64::MAX];
+        for &n in &nums {
+            buf.clear();
+            write_u64(&mut buf, n);
+            assert_eq!(buf, n.to_string().as_bytes());
+        }
     }
 }
